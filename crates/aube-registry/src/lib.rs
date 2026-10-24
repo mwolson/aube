@@ -14,8 +14,7 @@ compile_error!("aube-registry requires the `rustls` feature");
 
 // Visitor helper macros — each tolerant deserializer below picks the
 // subset that matches its custom handlers. Splitting these granularly
-// is what lets `funding_url` keep its own `visit_seq` (array case)
-// while `FundingArrayEntry` keeps its own `visit_map` (object case),
+// lets individual visitors handle their own array and object cases
 // without colliding on duplicate method definitions.
 
 /// Visit-primitives-as-default + `visit_some` re-entry. Covers the
@@ -443,15 +442,12 @@ pub struct VersionMetadata {
     /// degrade to `None` rather than failing to parse the packument.
     #[serde(default, deserialize_with = "license_string")]
     pub license: Option<String>,
-    /// `funding:` URL extracted from the manifest's `funding` field.
-    /// The field is documented as a string *or* an object with a
-    /// `url:` key *or* an array of either — npm's lockfile
-    /// normalizes to `{url: …}`, so we only keep the URL and let
-    /// the writer emit the wrapping object. Serde `rename` because
-    /// `rename_all = "camelCase"` would otherwise look for
-    /// `fundingUrl` in the JSON.
-    #[serde(default, rename = "funding", deserialize_with = "funding_url")]
+    /// First funding URL for consumers that display a link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funding_url: Option<String>,
+    /// Complete funding metadata retained for npm lockfile writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funding: Option<serde_json::Value>,
     /// `bin:` map from the packument, normalized to `name → path`.
     ///
     /// npm records `bin` in two shapes on a manifest: a string
@@ -527,7 +523,9 @@ struct VersionMetadataRaw {
     engines: BTreeMap<String, String>,
     #[serde(default, deserialize_with = "license_string")]
     license: Option<String>,
-    #[serde(default, rename = "funding", deserialize_with = "funding_url")]
+    #[serde(default)]
+    funding: Option<serde_json::Value>,
+    #[serde(default)]
     funding_url: Option<String>,
     #[serde(default, rename = "bin", deserialize_with = "bin_map")]
     bin: BTreeMap<String, String>,
@@ -565,7 +563,12 @@ impl From<VersionMetadataRaw> for VersionMetadata {
             libc: raw.libc,
             engines: raw.engines,
             license: raw.license,
-            funding_url: raw.funding_url,
+            funding_url: raw
+                .funding
+                .as_ref()
+                .and_then(first_funding_url)
+                .or(raw.funding_url),
+            funding: raw.funding,
             bin: raw.bin,
             has_install_script: raw
                 .has_install_script
@@ -712,67 +715,20 @@ where
     de.deserialize_any(V)
 }
 
-/// Extract the first `url:` out of a packument's `funding:` field.
-/// The field may be a URL string, a `{url: …}` object, or an array
-/// of either — npm's lockfile normalizes to `{"url": "…"}` on each
-/// package entry, so we only need the URL itself. Missing / empty
-/// / non-url-bearing shapes degrade to `None`.
-fn funding_url<'de, D>(de: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct V;
-    impl<'de> Visitor<'de> for V {
-        type Value = Option<String>;
-
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("a funding URL string, a {url} object, or an array of either")
+fn first_funding_url(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(url) => Some(url.as_str()),
+        serde_json::Value::Object(obj) => obj.get("url").and_then(serde_json::Value::as_str),
+        serde_json::Value::Array(items) => {
+            return items
+                .iter()
+                .filter(|item| !item.is_array())
+                .find_map(first_funding_url);
         }
-
-        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
-            Ok((!s.is_empty()).then(|| s.to_owned()))
-        }
-
-        fn visit_string<E: serde::de::Error>(self, s: String) -> Result<Self::Value, E> {
-            Ok((!s.is_empty()).then_some(s))
-        }
-
-        fn visit_map<A: MapAccess<'de>>(self, access: A) -> Result<Self::Value, A::Error> {
-            extract_url_from_map(access)
-        }
-
-        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
-            // Walk the array via `FundingArrayEntry`, which performs the
-            // same string-or-{url} extraction per element. First non-empty
-            // hit wins — drain the rest with `IgnoredAny` so we don't
-            // re-parse elements we'll discard.
-            while let Some(FundingArrayEntry(maybe)) = access.next_element()? {
-                if let Some(s) = maybe {
-                    while access.next_element::<IgnoredAny>()?.is_some() {}
-                    return Ok(Some(s));
-                }
-            }
-            Ok(None)
-        }
-
-        visit_primitives_to!('de, None);
+        _ => None,
     }
-    de.deserialize_any(V)
-}
-
-/// Shared map-walk for `funding`'s top-level object form and per-array-element
-/// object form: extract a non-empty `url` field, ignore everything else.
-fn extract_url_from_map<'de, A: MapAccess<'de>>(mut access: A) -> Result<Option<String>, A::Error> {
-    let mut found: Option<String> = None;
-    while let Some(key) = access.next_key::<String>()? {
-        if key == "url" && found.is_none() {
-            let MaybeString(maybe) = access.next_value()?;
-            found = maybe.filter(|s| !s.is_empty());
-        } else {
-            let _: IgnoredAny = access.next_value()?;
-        }
-    }
-    Ok(found)
+    .filter(|url| !url.is_empty())
+    .map(str::to_owned)
 }
 
 /// Accept the packument's `_npmUser:` field in its documented shapes
@@ -913,43 +869,6 @@ impl<'de> Deserialize<'de> for MaybeString {
             visit_primitives_to!('de, MaybeString(None));
             visit_seq_to!('de, MaybeString(None));
             visit_map_to!('de, MaybeString(None));
-        }
-        de.deserialize_any(V)
-    }
-}
-
-/// Array-element adapter for `funding`'s array case: yields `Some(url)`
-/// for a non-empty string or an object element with a non-empty `url`
-/// field; `None` otherwise. Mirrors the top-level `funding_url` shape.
-struct FundingArrayEntry(Option<String>);
-
-impl<'de> Deserialize<'de> for FundingArrayEntry {
-    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = FundingArrayEntry;
-
-            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("a funding URL string or a {url} object")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<FundingArrayEntry, E> {
-                Ok(FundingArrayEntry((!s.is_empty()).then(|| s.to_owned())))
-            }
-
-            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<FundingArrayEntry, E> {
-                Ok(FundingArrayEntry((!s.is_empty()).then_some(s)))
-            }
-
-            fn visit_map<A: MapAccess<'de>>(
-                self,
-                access: A,
-            ) -> Result<FundingArrayEntry, A::Error> {
-                Ok(FundingArrayEntry(extract_url_from_map(access)?))
-            }
-
-            visit_primitives_to!('de, FundingArrayEntry(None));
-            visit_seq_to!('de, FundingArrayEntry(None));
         }
         de.deserialize_any(V)
     }
@@ -1216,11 +1135,6 @@ mod tests {
         assert_eq!(map_bin.bin.get("foo"), Some(&"cli.js".to_string()));
     }
 
-    /// Round-trip the `bin` map through the on-disk cache format
-    /// (serialize → parse). Regression: the disk cache round-trips
-    /// the field under the name `bin`, so the deserializer *must*
-    /// accept a map back (and not interpret the already-normalized
-    /// map as an implicit-name string).
     #[test]
     fn bin_map_roundtrips_through_cache_serialization() {
         let mut bin = BTreeMap::new();
@@ -1241,6 +1155,7 @@ mod tests {
             engines: BTreeMap::new(),
             license: None,
             funding_url: None,
+            funding: None,
             bin,
             has_install_script: false,
             deprecated: None,
@@ -1557,5 +1472,25 @@ mod tests {
                 .names(&old.dependencies)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn funding_retains_complete_value_through_cache_serialization() {
+        for funding in [
+            serde_json::json!("https://example.com/string"),
+            serde_json::json!({"type":"github","url":"https://example.com/object"}),
+            serde_json::json!([{"type":"github","url":"https://example.com/one"},
+                "https://example.com/two", {"type":"other","url":"https://example.com/three"}]),
+        ] {
+            let metadata: VersionMetadata = serde_json::from_value(serde_json::json!({
+                "name":"foo","version":"1.0.0","funding":funding
+            }))
+            .unwrap();
+            assert_eq!(metadata.funding.as_ref(), Some(&funding));
+            let cached: VersionMetadata =
+                serde_json::from_slice(&serde_json::to_vec(&metadata).unwrap()).unwrap();
+            assert_eq!(cached.funding.as_ref(), Some(&funding));
+            assert_eq!(cached.funding_url, metadata.funding_url);
+        }
     }
 }

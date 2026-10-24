@@ -241,6 +241,8 @@ pub struct Resolver {
     /// active registry before cache seeding so installs still fetch
     /// package bytes from the configured source.
     force_metadata_primer: bool,
+    /// Complete registry manifests are required for new npm lockfile entries.
+    full_metadata: bool,
     pub(crate) packument_network_concurrency: Option<usize>,
 }
 
