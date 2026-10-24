@@ -1225,7 +1225,7 @@ pub(crate) fn configure_resolver(
     manifest: &aube_manifest::PackageJson,
     inputs: ResolverConfigInputs<'_>,
     read_package_hook: Option<Box<dyn aube_resolver::ReadPackageHook>>,
-) -> aube_resolver::Resolver {
+) -> miette::Result<aube_resolver::Resolver> {
     let ResolverConfigInputs {
         settings_ctx,
         workspace_config,
@@ -1348,6 +1348,7 @@ pub(crate) fn configure_resolver(
     let mut resolver = resolver
         .with_auto_install_peers(auto_install_peers)
         .with_peers_suffix_max_length(peers_suffix_max_length)
+        .with_peer_patch_hashes(crate::patches::read_patched_dependency_hashes(cwd)?)
         .with_exclude_links_from_lockfile(exclude_links_from_lockfile)
         .with_dedupe_peer_dependents(dedupe_peer_dependents)
         .with_dedupe_peers(dedupe_peers)
@@ -1367,12 +1368,11 @@ pub(crate) fn configure_resolver(
     if let Some(hook) = read_package_hook {
         resolver = resolver.with_read_package_hook(hook);
     }
-    resolver
+    Ok(resolver)
 }
 
-/// Check the resolved graph for declared required peer deps whose
-/// version doesn't satisfy the declared range, or that aren't in the
-/// tree at all. Prints the list of unmet peers and returns an `Err`
+/// Check the resolved graph for incompatible provided peers and missing
+/// required peers. Prints the list of unmet peers and returns an `Err`
 /// so the install fails.
 ///
 /// Only called under `strict-peer-dependencies=true`. The default

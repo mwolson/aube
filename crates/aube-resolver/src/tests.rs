@@ -3807,11 +3807,8 @@ fn detect_unmet_peers_flags_completely_missing_peer() {
     assert_eq!(u.found, None);
 }
 
-// Optional peers are suppressed even when they would otherwise be
-// flagged — matches pnpm's `peerDependenciesMeta.optional` behavior
-// with `auto-install-peers=true`.
 #[test]
-fn detect_unmet_peers_skips_optional_peers() {
+fn detect_unmet_peers_reports_provided_optional_peer_mismatches() {
     let mut consumer = mk_locked(
         "consumer",
         "1.0.0",
@@ -3832,7 +3829,171 @@ fn detect_unmet_peers_skips_optional_peers() {
         packages,
         ..Default::default()
     };
+    let unmet = detect_unmet_peers(&graph);
+    assert_eq!(unmet.len(), 1);
+    assert_eq!(unmet[0].found.as_deref(), Some("15.7.0"));
+
+    let mut graph = graph;
+    graph
+        .packages
+        .values_mut()
+        .next()
+        .unwrap()
+        .dependencies
+        .clear();
     assert!(detect_unmet_peers(&graph).is_empty());
+}
+
+#[tokio::test]
+async fn peer_patch_hashes_do_not_become_serialized_patch_metadata() {
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver =
+        Resolver::new(client).with_peer_patch_hashes([("foo@1.0.0".into(), "a".repeat(64))].into());
+    resolver.cache.insert(
+        "foo".into(),
+        make_packument("foo", &["1.0.0"], "1.0.0").into(),
+    );
+    let mut manifest = PackageJson::default();
+    manifest.dependencies.insert("foo".into(), "1.0.0".into());
+    let graph = resolver.resolve(&manifest, None).await.unwrap();
+    assert!(
+        graph.patched_dependencies.is_empty(),
+        "peer hashes leaked into serialized metadata: {:?}",
+        graph.patched_dependencies
+    );
+}
+
+#[test]
+fn strict_optional_peers_validate_source_manifest_versions() {
+    use aube_lockfile::LocalSource;
+    for source in [
+        LocalSource::Tarball("deps/react.tgz".into()),
+        LocalSource::RemoteTarball(aube_lockfile::RemoteTarballSource {
+            url: "https://example.test/react.tgz".into(),
+            integrity: String::new(),
+            git_hosted: false,
+        }),
+        LocalSource::Git(aube_lockfile::GitSource {
+            url: "https://example.test/react.git".into(),
+            committish: None,
+            resolved: "a".repeat(40),
+            integrity: None,
+            subpath: None,
+        }),
+    ] {
+        let target = source.dep_path("react");
+        let tail = target.strip_prefix("react@").unwrap();
+        let mut provider = mk_locked("react", "19.0.0", &[], &[]);
+        provider.dep_path = target.clone();
+        provider.local_source = Some(source);
+        let mut consumer = mk_locked(
+            "consumer",
+            "1.0.0",
+            &[("react", tail)],
+            &[("react", "^19.0.0")],
+        );
+        consumer.peer_dependencies_meta.insert(
+            "react".into(),
+            aube_lockfile::PeerDepMeta { optional: true },
+        );
+        let mut graph = LockfileGraph::default();
+        graph.packages.insert(provider.dep_path.clone(), provider);
+        graph.packages.insert(consumer.dep_path.clone(), consumer);
+        assert!(
+            detect_unmet_peers(&graph).is_empty(),
+            "compatible {tail}: {:?}",
+            detect_unmet_peers(&graph)
+        );
+        graph
+            .packages
+            .get_mut("consumer@1.0.0")
+            .unwrap()
+            .peer_dependencies
+            .insert("react".into(), "^18.0.0".into());
+        let unmet = detect_unmet_peers(&graph);
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].found.as_deref(), Some("19.0.0"));
+    }
+}
+
+#[test]
+fn parsed_directory_optional_peers_use_manifest_versions() {
+    check_parsed_local_optional_peers("vendor/react", "{directory: vendor/react, type: directory}");
+}
+
+#[test]
+fn parsed_tarball_optional_peers_use_manifest_versions() {
+    check_parsed_local_optional_peers("react.tgz", "{tarball: file:react.tgz}");
+}
+
+fn check_parsed_local_optional_peers(path: &str, resolution: &str) {
+    for suffix in ["", "(host@1.0.0)"] {
+        let dir = tempfile::tempdir().unwrap();
+        let lockfile = dir.path().join("pnpm-lock.yaml");
+        let provider_importer = if suffix.is_empty() {
+            format!("      react:\n        specifier: file:{path}\n        version: file:{path}\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            &lockfile,
+            format!(
+                r#"
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0
+{provider_importer}packages:
+  consumer@1.0.0:
+    peerDependencies:
+      react: ^19.0.0
+    peerDependenciesMeta:
+      react:
+        optional: true
+  react@file:{path}:
+    resolution: {resolution}
+    version: 19.0.0
+snapshots:
+  consumer@1.0.0:
+    optionalDependencies:
+      react: file:{path}{suffix}
+  react@file:{path}{suffix}: {{}}
+"#
+            ),
+        )
+        .unwrap();
+        let mut graph = aube_lockfile::pnpm::parse(&lockfile).unwrap();
+        let target = format!(
+            "{}{suffix}",
+            aube_lockfile::LocalSource::Directory(path.into()).dep_path("react")
+        );
+        assert!(graph.packages.contains_key(&target), "missing {target}");
+        assert_eq!(
+            aube_lockfile::resolve_dep_edge("react", &format!("file:{path}{suffix}"), |key| graph
+                .packages
+                .contains_key(key)),
+            Some(target)
+        );
+        assert!(
+            detect_unmet_peers(&graph).is_empty(),
+            "{:?}",
+            detect_unmet_peers(&graph)
+        );
+        graph
+            .packages
+            .get_mut("consumer@1.0.0")
+            .unwrap()
+            .peer_dependencies
+            .insert("react".into(), "^18.0.0".into());
+        let unmet = detect_unmet_peers(&graph);
+        assert_eq!(unmet.len(), 1);
+        assert_eq!(unmet[0].found.as_deref(), Some("19.0.0"));
+    }
 }
 
 // Mutual dependency cycles must not hang the BFS resolver. The

@@ -487,6 +487,251 @@ fn completion_bin_selects_one_program_and_rejects_install() {
 }
 
 #[test]
+fn native_pnpm_workspace_local_peer_context_survives_without_gvs() {
+    use assert_cmd::assert::OutputAssertExt;
+
+    let _guard = e2e_lock();
+    for gvs in [false, true] {
+        let sbx = Sandbox::new();
+        let mut lockfile = include_str!("fixtures/pnpm-local-peer-context.yaml").to_string();
+        for (file, manifest, script) in [
+            (
+                "consumer",
+                serde_json::json!({"name": "consumer", "version": "1.0.0", "main": "index.js", "peerDependencies": {"react": "^19.0.0"}}),
+                "module.exports = require('react');",
+            ),
+            (
+                "host",
+                serde_json::json!({"name": "host", "version": "1.0.0", "main": "index.js"}),
+                "module.exports = 'host';",
+            ),
+            (
+                "react18",
+                serde_json::json!({"name": "react", "version": "18.0.0", "main": "index.js"}),
+                "module.exports = '18.0.0';",
+            ),
+            (
+                "react19",
+                serde_json::json!({"name": "react", "version": "19.0.0", "main": "index.js", "peerDependencies": {"host": "^1.0.0"}}),
+                "module.exports = '19.0.0';",
+            ),
+        ] {
+            let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut tar = tar::Builder::new(gzip);
+            for (name, contents) in [
+                ("package.json", manifest.to_string()),
+                ("index.js", script.into()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, format!("package/{name}"), contents.as_bytes())
+                    .unwrap();
+            }
+            let archive = tar.into_inner().unwrap().finish().unwrap();
+            lockfile = lockfile.replace(
+                &format!("__{}_INTEGRITY__", file.to_uppercase()),
+                &aube_store::sha512_integrity(&archive),
+            );
+            fs::write(sbx.project.join(format!("{file}.tgz")), archive).unwrap();
+        }
+        sbx.write_manifest(r#"{"name":"root","private":true,"dependencies":{"react":"file:react18.tgz","host":"file:host.tgz"}}"#);
+        let member = sbx.project.join("apps/app");
+        fs::create_dir_all(&member).unwrap();
+        fs::write(member.join("package.json"), r#"{"name":"app","private":true,"dependencies":{"react":"file:../../react19.tgz","host":"file:../../host.tgz","consumer":"file:../../consumer.tgz"}}"#).unwrap();
+        fs::write(
+            sbx.project.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n",
+        )
+        .unwrap();
+        fs::write(
+            sbx.project.join(".npmrc"),
+            "auto-install-peers=false\nstrict-peer-dependencies=false\nnode-linker=isolated\n",
+        )
+        .unwrap();
+        let lockfile_path = sbx.project.join("pnpm-lock.yaml");
+        fs::write(&lockfile_path, &lockfile).unwrap();
+        let gvs_flag = if gvs {
+            "--enable-global-virtual-store"
+        } else {
+            "--disable-global-virtual-store"
+        };
+        for _ in 0..2 {
+            sbx.cmd()
+                .args(["install", "--frozen-lockfile", "--ignore-scripts", gvs_flag])
+                .assert()
+                .success();
+            std::process::Command::new("node")
+                .current_dir(&sbx.project)
+                .args([
+                    "-e",
+                    "console.log(require('./apps/app/node_modules/consumer'))",
+                ])
+                .assert()
+                .success()
+                .stdout("19.0.0\n");
+            let consumer = fs::canonicalize(member.join("node_modules/consumer")).unwrap();
+            let peer = consumer.parent().unwrap().join("react");
+            let manifest: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(peer.join("package.json")).unwrap())
+                    .unwrap();
+            assert_eq!(manifest["version"], "19.0.0", "GVS={gvs}");
+            assert_eq!(fs::read_to_string(&lockfile_path).unwrap(), lockfile);
+            fs::remove_dir_all(sbx.project.join("node_modules")).unwrap();
+            fs::remove_dir_all(member.join("node_modules")).unwrap();
+        }
+    }
+}
+
+#[test]
+fn directory_optional_peer_survives_clean_frozen_pnpm_install() {
+    check_local_optional_peer(false);
+}
+
+#[test]
+fn tarball_optional_peer_survives_clean_frozen_pnpm_install() {
+    check_local_optional_peer(true);
+}
+
+fn check_local_optional_peer(tarball: bool) {
+    let _guard = e2e_lock();
+    for compatible in [true, false] {
+        let sbx = Sandbox::new();
+        let provider = sbx.project.join("vendor/react");
+        fs::create_dir_all(&provider).unwrap();
+        fs::write(
+            provider.join("package.json"),
+            r#"{"name":"react","version":"19.0.0"}"#,
+        )
+        .unwrap();
+        let spec = if tarball {
+            let archive = fs::File::create(sbx.project.join("react.tgz")).unwrap();
+            let gzip = flate2::write::GzEncoder::new(archive, flate2::Compression::default());
+            let mut tar = tar::Builder::new(gzip);
+            tar.append_dir_all("package", &provider).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            "file:react.tgz"
+        } else {
+            "file:vendor/react"
+        };
+        let manifest = serde_json::json!({
+            "name": "consumer", "version": "1.0.0",
+            "peerDependencies": {"react": if compatible { "^19.0.0" } else { "^18.0.0" }},
+            "peerDependenciesMeta": {"react": {"optional": true}}
+        });
+        let consumer = sbx._root.path().join("consumer");
+        fs::create_dir_all(&consumer).unwrap();
+        fs::write(consumer.join("package.json"), manifest.to_string()).unwrap();
+        let store = aube_store::Store::with_dirs(sbx.store.join("v1/files"), sbx.cache.clone());
+        let index = store.import_directory(&consumer).unwrap();
+        store.save_index("consumer", "1.0.0", None, &index).unwrap();
+        let mut metadata = manifest;
+        metadata["dist"] = serde_json::json!({"tarball": "https://registry.npmjs.org/consumer/-/consumer-1.0.0.tgz"});
+        let packument = serde_json::from_value(serde_json::json!({
+            "name": "consumer", "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": metadata}
+        }))
+        .unwrap();
+        let client = aube_registry::client::RegistryClient::new("https://registry.npmjs.org/");
+        client.seed_packument_cache(
+            "consumer",
+            &sbx.cache.join("packuments-v1"),
+            &packument,
+            None,
+            None,
+            true,
+        );
+        client.seed_full_packument_cache(
+            "consumer",
+            &sbx.cache.join("packuments-full-v1"),
+            &packument,
+            None,
+            None,
+            true,
+        );
+        sbx.write_manifest(
+            &serde_json::json!({
+                "name": "local-peer", "private": true,
+                "dependencies": {"consumer": "1.0.0", "react": spec}
+            })
+            .to_string(),
+        );
+        let npmrc = sbx.project.join(".npmrc");
+        fs::write(
+            &npmrc,
+            "strict-peer-dependencies=true\nauto-install-peers=false\n",
+        )
+        .unwrap();
+        let lockfile = sbx.project.join("pnpm-lock.yaml");
+        fs::write(&lockfile, "lockfileVersion: '9.0'\n").unwrap();
+        let mut fresh = sbx.cmd();
+        fresh.args([
+            "install",
+            "--offline",
+            "--ignore-scripts",
+            "--no-frozen-lockfile",
+        ]);
+        if compatible {
+            fresh.assert().success();
+        } else {
+            fresh
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains("found 19.0.0"));
+            fs::write(
+                &npmrc,
+                "strict-peer-dependencies=false\nauto-install-peers=false\n",
+            )
+            .unwrap();
+            sbx.cmd()
+                .args([
+                    "install",
+                    "--offline",
+                    "--ignore-scripts",
+                    "--no-frozen-lockfile",
+                ])
+                .assert()
+                .success();
+            fs::write(
+                &npmrc,
+                "strict-peer-dependencies=true\nauto-install-peers=false\n",
+            )
+            .unwrap();
+        }
+        let before = fs::read(&lockfile).unwrap();
+        fs::remove_dir_all(sbx.project.join("node_modules")).unwrap();
+        let mut frozen = sbx.cmd();
+        frozen.args([
+            "install",
+            "--offline",
+            "--ignore-scripts",
+            "--frozen-lockfile",
+        ]);
+        if compatible {
+            frozen.assert().success();
+            assert!(sbx.project.join("node_modules/consumer").is_dir());
+            assert!(sbx.project.join("node_modules/react").is_dir());
+            let linked: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(
+                    sbx.project
+                        .join("node_modules/consumer/../react/package.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(linked["version"], "19.0.0");
+        } else {
+            frozen
+                .assert()
+                .failure()
+                .stderr(predicates::str::contains("found 19.0.0"));
+        }
+        assert_eq!(fs::read(&lockfile).unwrap(), before);
+    }
+}
+
+#[test]
 fn directory_bundle_declarations_resolve_children_without_source_install() {
     check_directory_bundle(false);
 }
