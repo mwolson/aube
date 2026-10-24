@@ -123,7 +123,7 @@ pub(crate) fn segments_to_install_path(segs: &[String]) -> String {
 pub(crate) fn build_hoist_tree(
     canonical: &BTreeMap<String, &LockedPackage>,
     roots: &[DirectDep],
-    preferred_roots: Option<&BTreeMap<String, String>>,
+    preferred_placements: Option<&BTreeMap<Vec<String>, String>>,
     reserved_roots: &BTreeSet<String>,
 ) -> BTreeMap<Vec<String>, String> {
     let mut placed: BTreeMap<Vec<String>, String> = BTreeMap::new();
@@ -154,13 +154,13 @@ pub(crate) fn build_hoist_tree(
     // arbitrarily replace the version npm had already hoisted. Direct roots
     // above remain authoritative, and the reachability gate prevents stale
     // lockfile entries from surviving after their last edge is removed.
-    if let Some(preferred_roots) = preferred_roots {
+    if let Some(preferred_placements) = preferred_placements {
         let reachable = reachable_canonical_keys(canonical, roots);
-        for (name, key) in preferred_roots {
-            if !reachable.contains(key) {
+        for (segs, key) in preferred_placements {
+            if segs.len() != 1 || !reachable.contains(key) {
                 continue;
             }
-            let root_slot = vec![name.clone()];
+            let root_slot = segs.clone();
             if placed.contains_key(&root_slot) {
                 continue;
             }
@@ -173,6 +173,31 @@ pub(crate) fn build_hoist_tree(
         let Some(pkg) = canonical.get(&parent_key).copied() else {
             continue;
         };
+        // An existing dependency may live beside its consumer under an
+        // ancestor, rather than directly inside the consumer's node_modules.
+        if let Some(preferred) = preferred_placements {
+            for (child_name, child_value) in &pkg.dependencies {
+                let child_key = child_canonical_key(child_name, child_value);
+                let root_slot = vec![child_name.clone()];
+                let root_unchanged = preferred
+                    .get(&root_slot)
+                    .is_none_or(|key| placed.get(&root_slot) == Some(key));
+                if !root_unchanged || !canonical.contains_key(&child_key) {
+                    continue;
+                }
+                for depth in (1..=parent_segs.len()).rev() {
+                    let mut nested = parent_segs[..depth].to_vec();
+                    nested.push(child_name.clone());
+                    if let Some(preferred_key) = preferred.get(&nested) {
+                        if preferred_key == &child_key && !placed.contains_key(&nested) {
+                            placed.insert(nested.clone(), child_key.clone());
+                            queue.push_back((nested, child_key.clone()));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         let mut child_entries: Vec<(String, String)> = Vec::new();
         for (child_name, child_value) in &pkg.dependencies {
             let child_key = child_canonical_key(child_name, child_value);

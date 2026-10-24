@@ -40,6 +40,12 @@ pub(super) struct RawNpmPackage {
     #[serde(default)]
     pub(super) link: bool,
     #[serde(default)]
+    pub(super) peer: bool,
+    #[serde(default)]
+    pub(super) in_bundle: bool,
+    #[serde(default, alias = "bundledDependencies")]
+    pub(super) bundle_dependencies: Vec<String>,
+    #[serde(default)]
     pub(super) dependencies: BTreeMap<String, String>,
     #[serde(default)]
     pub(super) dev_dependencies: BTreeMap<String, String>,
@@ -87,6 +93,15 @@ pub(super) struct RawNpmPackage {
     #[serde(default)]
     pub(super) has_install_script: bool,
 }
+
+pub(super) const BUNDLED_OPTIONAL_KEY: &str = "__aube_npm_bundled_optional";
+
+pub(super) const BUNDLED_ENTRIES_KEY: &str = "__aube_npm_bundled_entries";
+
+// Original peer classification, retained across resolver reuse.
+pub(super) const NON_PEER_KEY: &str = "__aube_npm_non_peer_reachable";
+
+pub(super) const PEER_KEY: &str = "__aube_npm_peer";
 
 /// `LockedPackage::extra_meta` key carrying npm's `hasInstallScript: true`
 /// so a parse/write cycle keeps it.
