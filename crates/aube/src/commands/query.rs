@@ -197,7 +197,11 @@ fn collect_entries<'g>(
             continue;
         };
         for (name, tail) in &parent.dependencies {
-            let child_dep_path = format!("{name}@{tail}");
+            let Some(child_dep_path) =
+                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            else {
+                continue;
+            };
             let Some(child) = graph.get_package(&child_dep_path) else {
                 continue;
             };

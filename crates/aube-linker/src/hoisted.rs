@@ -483,11 +483,11 @@ fn build_workspace_preferences(
             continue;
         }
         for (dep_name, dep_tail) in &pkg.dependencies {
-            let child_dep_path = aube_lockfile::shared_local_dep_path(dep_name, dep_tail)
-                .unwrap_or_else(|| format!("{dep_name}@{dep_tail}"));
-            if !graph.packages.contains_key(&child_dep_path) {
+            let Some(child_dep_path) = aube_lockfile::resolve_dep_edge(dep_name, dep_tail, |key| {
+                graph.packages.contains_key(key)
+            }) else {
                 continue;
-            }
+            };
             let entry = entries
                 .entry((dep_name.clone(), child_dep_path.clone()))
                 .or_insert_with(|| {
@@ -609,15 +609,11 @@ fn complete_plan(
             HoistingLimits::Dependencies => outcome.node_idx,
         };
         for (dep_name, dep_tail) in &pkg.dependencies {
-            // Git / remote-tarball deps are recorded by their resolved URL
-            // spec but keyed under the short `name@git+<hash>` /
-            // `name@url+<hash>` form, so the verbatim `name@tail` key would
-            // miss `graph.packages` and silently drop the dep's subtree.
-            let child_dep_path = aube_lockfile::shared_local_dep_path(dep_name, dep_tail)
-                .unwrap_or_else(|| format!("{dep_name}@{dep_tail}"));
-            if !graph.packages.contains_key(&child_dep_path) {
+            let Some(child_dep_path) = aube_lockfile::resolve_dep_edge(dep_name, dep_tail, |key| {
+                graph.packages.contains_key(key)
+            }) else {
                 continue;
-            }
+            };
             queue.push_back((
                 outcome.node_idx,
                 child_floor,
@@ -879,6 +875,55 @@ mod tests {
             .filter(|node| node.dep_path.as_deref() == Some(dep_path))
             .filter_map(|node| node.pkg_dir.clone())
             .collect()
+    }
+
+    #[test]
+    fn local_edges_resolve_contextual_targets_before_bare_fallback() {
+        let root_nm = PathBuf::from("/workspace/node_modules");
+        for path in ["vendor/child", "child.tgz"] {
+            for contextual in [false, true] {
+                let bare = LocalSource::Directory(path.into()).dep_path("child");
+                let selected = if contextual {
+                    format!("{bare}(peer@1.0.0)")
+                } else {
+                    bare.clone()
+                };
+                let edge = format!("file:{path}(peer@1.0.0)");
+                let mut graph = LockfileGraph::default();
+                graph.packages.insert(
+                    "host@1.0.0".into(),
+                    pkg("host", "1.0.0", &[("child", &edge)]),
+                );
+                let mut child = pkg("child", "1.0.0", &[("leaf", "1.0.0")]);
+                child.dep_path = selected.clone();
+                graph.packages.insert(selected.clone(), child);
+                if contextual {
+                    let mut other = pkg("child", "2.0.0", &[]);
+                    other.dep_path = bare.clone();
+                    graph.packages.insert(bare.clone(), other);
+                }
+                graph
+                    .packages
+                    .insert("leaf@1.0.0".into(), pkg("leaf", "1.0.0", &[]));
+                let importers = vec![HoistedWorkspaceImporter {
+                    modules_dir: root_nm.clone(),
+                    dependencies: vec![dep("host", "host@1.0.0")],
+                }];
+                let preferred = build_workspace_preferences(&root_nm, &importers, &graph);
+                assert_eq!(preferred.get("child"), Some(&selected));
+                assert_eq!(
+                    preferred.get("leaf").map(String::as_str),
+                    Some("leaf@1.0.0")
+                );
+                let plan =
+                    plan_workspace(&root_nm, &importers, &graph, HoistingLimits::None).unwrap();
+                assert_eq!(package_dir(&plan, &selected), root_nm.join("child"));
+                assert_eq!(package_dir(&plan, "leaf@1.0.0"), root_nm.join("leaf"));
+                if contextual {
+                    assert!(package_dirs(&plan, &bare).is_empty());
+                }
+            }
+        }
     }
 
     #[test]

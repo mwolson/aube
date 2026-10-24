@@ -139,6 +139,8 @@ fn read_tarball_package_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// extracting the rest of the archive.
 pub(crate) struct LocalManifest {
     pub name: String,
+    pub integrity: Option<String>,
+    pub bundled_dependencies: Option<aube_manifest::BundledDependencies>,
     pub version: String,
     pub dependencies: BTreeMap<String, String>,
     pub optional_dependencies: BTreeMap<String, String>,
@@ -158,6 +160,7 @@ pub(crate) fn read_local_manifest(
     };
     let path = importer_root.join(local_path);
 
+    let mut integrity = None;
     let content = match local {
         LocalSource::Directory(_) | LocalSource::Link(_) | LocalSource::Portal(_) => {
             std::fs::read(path.join("package.json"))
@@ -166,6 +169,7 @@ pub(crate) fn read_local_manifest(
         LocalSource::Tarball(_) => {
             let bytes = std::fs::read(&path)
                 .map_err(|e| Error::Registry(local.specifier(), e.to_string()))?;
+            integrity = Some(aube_store::sha512_integrity(&bytes));
             read_tarball_package_json(&bytes).map_err(|e| Error::Registry(local.specifier(), e))?
         }
         LocalSource::Exec(_) | LocalSource::Git(_) | LocalSource::RemoteTarball(_) => {
@@ -199,6 +203,8 @@ pub(crate) fn read_local_manifest(
             .or_insert_with(|| "*".to_string());
     }
     Ok(LocalManifest {
+        integrity,
+        bundled_dependencies: pj.bundled_dependencies,
         name: pj.name.unwrap_or_default(),
         version: pj.version.unwrap_or_else(|| "0.0.0".to_string()),
         dependencies: pj.dependencies,
@@ -1053,6 +1059,38 @@ mod git_package_manifest_tests {
             err.to_string()
                 .contains("stat git package root in clone at /packages/missing"),
             "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod local_tarball_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn local_manifest_hashes_the_original_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkg.tgz");
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let manifest = br#"{"name":"pkg","version":"2.3.4"}"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let manifest =
+            read_local_manifest(&LocalSource::Tarball("pkg.tgz".into()), dir.path()).unwrap();
+        assert_eq!(manifest.version, "2.3.4");
+        assert_eq!(
+            manifest.integrity,
+            Some(aube_store::sha512_integrity(&bytes))
         );
     }
 }

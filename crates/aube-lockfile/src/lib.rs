@@ -53,6 +53,9 @@ pub(crate) const EXTRA_YARN_BERRY_CONDITIONS: &str = "__aube_yarn_berry_conditio
 
 pub(crate) const EXTRA_YARN_BERRY_PRESERVED_BLOCKS: &str = "__aube_yarn_berry_preserved_blocks";
 
+/// Internal declaration shape used when writing pnpm package metadata.
+pub const EXTRA_PNPM_BUNDLED_DEPENDENCIES: &str = "__aube_pnpm_bundled_dependencies";
+
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -85,6 +88,8 @@ pub struct LockfileGraph {
     /// `override_rule::OverrideRule`s at the start of each resolve
     /// pass.
     pub overrides: BTreeMap<String, String>,
+    /// Declaration order retained by the pnpm writer.
+    pub pnpm_override_order: Vec<String>,
     /// pnpm's top-level `packageExtensionsChecksum:` — a `sha256-`
     /// prefixed `object-hash` of the effective `packageExtensions`
     /// config. Lets pnpm detect that the extensions changed (and the
@@ -286,6 +291,8 @@ pub struct LockfileSettings {
     /// `settings:` header so it survives parse/write cycles without
     /// re-reading `.npmrc`.
     pub lockfile_include_tarball_url: bool,
+    /// Additional pnpm settings, including resolution settings unknown to aube.
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for LockfileSettings {
@@ -294,6 +301,7 @@ impl Default for LockfileSettings {
             auto_install_peers: true,
             exclude_links_from_lockfile: false,
             lockfile_include_tarball_url: false,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -795,6 +803,49 @@ mod locked_package_tests {
     }
 
     #[test]
+    fn get_dep_package_resolves_registry_full_and_source_edges() {
+        let mut graph = LockfileGraph::default();
+        let mut plain = pkg();
+        plain.dep_path = "pkg@1.0.0(peer@2.0.0)".to_string();
+        graph.packages.insert(plain.dep_path.clone(), plain);
+        let source = LocalSource::RemoteTarball(RemoteTarballSource {
+            url: "https://example.com/pkg.tgz".to_string(),
+            integrity: String::new(),
+            git_hosted: false,
+        });
+        let mut remote = pkg();
+        remote.dep_path = source.dep_path("remote");
+        graph.packages.insert(remote.dep_path.clone(), remote);
+        for (name, tail, expected) in [
+            (
+                "pkg",
+                "1.0.0(peer@2.0.0)",
+                "pkg@1.0.0(peer@2.0.0)".to_string(),
+            ),
+            (
+                "pkg",
+                "pkg@1.0.0(peer@2.0.0)",
+                "pkg@1.0.0(peer@2.0.0)".to_string(),
+            ),
+            (
+                "remote",
+                "https://example.com/pkg.tgz",
+                source.dep_path("remote"),
+            ),
+        ] {
+            let (key, package) = graph.get_dep_package(name, tail).unwrap();
+            assert_eq!(key, &expected);
+            assert!(std::ptr::eq(package, &graph.packages[key]));
+        }
+        assert!(graph.get_dep_package("missing", "1.0.0").is_none());
+        assert!(
+            graph
+                .get_dep_package("missing", "file:vendor/missing")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn rebase_local_sources_rekeys_the_package_and_its_references() {
         let old = LocalSource::Directory(PathBuf::from("../vendor/dep"));
         let new = LocalSource::Directory(PathBuf::from("vendor/dep"));
@@ -844,6 +895,56 @@ mod locked_package_tests {
             new_key
         );
     }
+
+    #[test]
+    fn rebase_local_sources_preserves_file_edges_and_peer_suffixes() {
+        for tarball in [false, true] {
+            for suffix in ["", "(peer@1.0.0)"] {
+                let old_path = PathBuf::from("../vendor/child");
+                let new_path = PathBuf::from("vendor/child");
+                let source = |path| {
+                    if tarball {
+                        LocalSource::Tarball(path)
+                    } else {
+                        LocalSource::Directory(path)
+                    }
+                };
+                let old = source(old_path);
+                let new = source(new_path);
+                let old_key = format!("{}{suffix}", old.dep_path("child"));
+                let new_key = format!("{}{suffix}", new.dep_path("child"));
+                let edge = format!("file:../vendor/child{suffix}");
+                let mut child = pkg();
+                child.name = "child".to_string();
+                child.dep_path = old_key.clone();
+                child.local_source = Some(old.clone());
+                let mut host = pkg();
+                host.dependencies.insert("child".to_string(), edge.clone());
+                host.optional_dependencies.insert("child".to_string(), edge);
+                host.dependencies
+                    .insert("missing".to_string(), "file:../missing".to_string());
+                let mut graph = LockfileGraph::default();
+                graph.packages.insert(old_key.clone(), child);
+                graph.packages.insert("pkg@1.0.0".to_string(), host);
+
+                graph.rebase_local_sources(|_, value| (*value == old).then(|| new.clone()));
+
+                assert!(!graph.packages.contains_key(&old_key));
+                assert_eq!(graph.packages[&new_key].local_source, Some(new));
+                let host = &graph.packages["pkg@1.0.0"];
+                for edges in [&host.dependencies, &host.optional_dependencies] {
+                    assert_eq!(edges["child"], format!("file:vendor/child{suffix}"));
+                    assert_eq!(
+                        resolve_dep_edge("child", &edges["child"], |key| graph
+                            .packages
+                            .contains_key(key)),
+                        Some(new_key.clone())
+                    );
+                }
+                assert_eq!(host.dependencies["missing"], "file:../missing");
+            }
+        }
+    }
 }
 
 /// Metadata about a single declared peer dependency. Matches the shape of
@@ -863,6 +964,16 @@ impl LockfileGraph {
     /// Get a package by its dep_path key.
     pub fn get_package(&self, dep_path: &str) -> Option<&LockedPackage> {
         self.packages.get(dep_path)
+    }
+
+    /// Resolve an edge and borrow its package key and node. Registry edges
+    /// take one lookup; local-source fallbacks run only when that key is absent.
+    pub fn get_dep_package(&self, name: &str, tail: &str) -> Option<(&String, &LockedPackage)> {
+        if let Some(entry) = self.packages.get_key_value(&format!("{name}@{tail}")) {
+            return Some(entry);
+        }
+        let key = resolve_dep_edge(name, tail, |key| self.packages.contains_key(key))?;
+        self.packages.get_key_value(&key)
     }
 
     /// The version a direct dep resolved to. A workspace dep has no
@@ -890,6 +1001,18 @@ impl LockfileGraph {
         &mut self,
         mut rebase: impl FnMut(&str, &LocalSource) -> Option<LocalSource>,
     ) {
+        // Resolve source-bearing edges before their path-hashed targets move.
+        let file_edges: BTreeMap<_, _> = self
+            .packages
+            .values()
+            .flat_map(|pkg| pkg.dependencies.iter().chain(&pkg.optional_dependencies))
+            .filter(|(_, tail)| tail.starts_with("file:"))
+            .filter_map(|(name, tail)| {
+                resolve_dep_edge(name, tail, |key| self.packages.contains_key(key))
+                    .map(|key| ((name.clone(), tail.clone()), key))
+            })
+            .collect();
+        let mut rebased_file_sources = BTreeMap::new();
         let mut renamed = BTreeMap::new();
         for (key, mut pkg) in std::mem::take(&mut self.packages) {
             let mut new_key = key.clone();
@@ -904,6 +1027,14 @@ impl LockfileGraph {
                     if pkg.dep_path == key {
                         pkg.dep_path = new_key.clone();
                     }
+                }
+                if new_key != key
+                    && let LocalSource::Directory(path) | LocalSource::Tarball(path) = &new
+                {
+                    rebased_file_sources.insert(
+                        key.clone(),
+                        format!("file:{}", path.to_string_lossy().replace('\\', "/")),
+                    );
                 }
                 pkg.local_source = Some(new);
             }
@@ -928,7 +1059,13 @@ impl LockfileGraph {
             {
                 // A value holds either the whole key or, as the pnpm
                 // reader stores it, the part after `name@`.
-                if let Some(new_key) = renamed.get(tail.as_str()) {
+                if let Some(source) = file_edges
+                    .get(&(name.clone(), tail.clone()))
+                    .and_then(|key| rebased_file_sources.get(key))
+                {
+                    let suffix = tail.find('(').map(|i| &tail[i..]).unwrap_or("");
+                    *tail = format!("{source}{suffix}");
+                } else if let Some(new_key) = renamed.get(tail.as_str()) {
                     *tail = new_key.clone();
                 } else if let Some(new_key) = renamed.get(&format!("{name}@{tail}"))
                     && let Some(new_tail) = new_key.strip_prefix(&format!("{name}@"))
@@ -965,7 +1102,11 @@ impl LockfileGraph {
                 continue;
             };
             for (child_name, child_version) in &pkg.dependencies {
-                let child_key = format!("{child_name}@{child_version}");
+                let Some(child_key) = resolve_dep_edge(child_name, child_version, |key| {
+                    self.packages.contains_key(key)
+                }) else {
+                    continue;
+                };
                 if reachable.insert(child_key.clone()) {
                     queue.push_back(child_key);
                 }
@@ -1023,6 +1164,7 @@ impl LockfileGraph {
         let packages = self.packages_restricted_to(&reachable);
 
         LockfileGraph {
+            pnpm_override_order: self.pnpm_override_order.clone(),
             importers,
             packages,
             // Preserve the source graph's settings — filter is a
@@ -1100,6 +1242,7 @@ impl LockfileGraph {
         importers.insert(".".to_string(), kept);
 
         Some(LockfileGraph {
+            pnpm_override_order: self.pnpm_override_order.clone(),
             importers,
             packages,
             settings: self.settings.clone(),
@@ -1136,6 +1279,13 @@ impl LockfileGraph {
     /// on any pair of graphs — parsing the old lockfile is the
     /// caller's concern.
     pub fn overlay_metadata_from(&mut self, prior: &LockfileGraph) {
+        self.pnpm_override_order = prior.pnpm_override_order.clone();
+        for (key, value) in &prior.settings.extra {
+            self.settings
+                .extra
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
         // Build a canonical `name@version → prior pkg` lookup once so
         // repeated peer-context variants in `self.packages` all hit
         // the same prior entry.
