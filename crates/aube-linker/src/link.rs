@@ -200,6 +200,7 @@ impl Linker {
                     .get(dep_path)
                     .ok_or_else(|| Error::MissingPackageIndex(dep_path.to_string()))?;
                 self.ensure_shared_local_in_global_store(
+                    graph,
                     &aube_dir,
                     dep_path,
                     pkg,
@@ -238,6 +239,7 @@ impl Linker {
             }
             if !aube_entry.exists() {
                 self.materialize_at(
+                    graph,
                     &aube_dir.join(self.aube_dir_entry_name(dep_path)),
                     &aube_dir,
                     dep_path,
@@ -337,6 +339,7 @@ impl Linker {
                                 return Ok((local_stats, None));
                             }
                             let reconciled = self.reconcile_virtual_store_entry(
+                                graph,
                                 dep_path,
                                 pkg,
                                 nested_link_targets.as_ref(),
@@ -380,6 +383,7 @@ impl Linker {
                                 try_remove_entry(&local_aube_entry);
                             }
                             self.materialize_at(
+                                graph,
                                 &aube_dir.join(self.aube_dir_entry_name(dep_path)),
                                 &aube_dir,
                                 dep_path,
@@ -393,6 +397,7 @@ impl Linker {
                         }
 
                         self.ensure_in_virtual_store_with_subdir(
+                            graph,
                             dep_path,
                             subdir,
                             pkg,
@@ -421,6 +426,7 @@ impl Linker {
                             None
                         } else {
                             recordable_dep_link_targets(self.virtual_store_dep_link_targets(
+                                graph,
                                 dep_path,
                                 pkg,
                                 nested_link_targets.as_ref(),
@@ -509,6 +515,7 @@ impl Linker {
                                 }
                             };
                             self.materialize_replacing(
+                                graph,
                                 &aube_dir,
                                 dep_path,
                                 pkg,
@@ -914,6 +921,7 @@ impl Linker {
                     .get(dep_path)
                     .ok_or_else(|| Error::MissingPackageIndex(dep_path.to_string()))?;
                 self.ensure_shared_local_in_global_store(
+                    graph,
                     &aube_dir,
                     dep_path,
                     pkg,
@@ -965,6 +973,7 @@ impl Linker {
                 continue;
             }
             self.materialize_at(
+                graph,
                 &aube_dir.join(self.aube_dir_entry_name(dep_path)),
                 &aube_dir,
                 dep_path,
@@ -1033,6 +1042,7 @@ impl Linker {
                             if matches!(state, EntryState::Fresh) {
                                 if !project_local {
                                     self.reconcile_virtual_store_entry(
+                                        graph,
                                         dep_path,
                                         pkg,
                                         nested_link_targets.as_ref(),
@@ -1064,6 +1074,7 @@ impl Linker {
                                     try_remove_entry(&local_aube_entry);
                                 }
                                 self.materialize_at(
+                                    graph,
                                     &aube_dir.join(self.aube_dir_entry_name(dep_path)),
                                     &aube_dir,
                                     dep_path,
@@ -1077,6 +1088,7 @@ impl Linker {
                             }
 
                             self.ensure_in_virtual_store_with_subdir(
+                                graph,
                                 dep_path,
                                 subdir,
                                 pkg,
@@ -1149,6 +1161,7 @@ impl Linker {
                                 }
                             };
                             self.materialize_replacing(
+                                graph,
                                 &aube_dir,
                                 dep_path,
                                 pkg,

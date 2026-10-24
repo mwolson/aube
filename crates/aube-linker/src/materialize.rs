@@ -7,7 +7,7 @@ use crate::sweep::{
     try_remove_entry,
 };
 use crate::{Error, LinkStats, LinkStrategy, Linker, sys};
-use aube_lockfile::{LocalSource, LockedPackage, shared_local_dep_path};
+use aube_lockfile::{LockedPackage, LockfileGraph, local_dep_path};
 use aube_store::{PackageIndex, StoredFile};
 use std::collections::BTreeMap;
 use std::io;
@@ -248,8 +248,10 @@ impl Linker {
     /// `~/.cache/aube/virtual-store/<subdir>` entry. Link step 1 then
     /// hits the `pkg_nm_dir.exists()` fast path and only creates the
     /// per-project `.aube/<dep_path>` symlink.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_in_virtual_store(
         &self,
+        graph: &LockfileGraph,
         dep_path: &str,
         pkg: &LockedPackage,
         index: &PackageIndex,
@@ -267,6 +269,7 @@ impl Linker {
         // package against different toolchains don't collide.
         let subdir = self.virtual_store_subdir(dep_path);
         self.ensure_in_virtual_store_with_subdir(
+            graph,
             dep_path,
             &subdir,
             pkg,
@@ -285,8 +288,10 @@ impl Linker {
     /// long/scoped/peer-context names). `subdir` MUST equal
     /// `self.virtual_store_subdir(dep_path)`; the public wrapper above
     /// guarantees that for callers that don't already have it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ensure_in_virtual_store_with_subdir(
         &self,
+        graph: &LockfileGraph,
         dep_path: &str,
         subdir: &str,
         pkg: &LockedPackage,
@@ -314,7 +319,7 @@ impl Linker {
         let trust_existing = !self.force || self.fresh_virtual_store_entries.contains(dep_path);
         if trust_existing && pkg_nm_dir.exists() {
             if !self.fresh_virtual_store_entries.contains(dep_path) {
-                self.reconcile_virtual_store_entry(dep_path, pkg, nested_link_targets)?;
+                self.reconcile_virtual_store_entry(graph, dep_path, pkg, nested_link_targets)?;
             }
             trace!("virtual store hit: {dep_path}");
             stats.packages_cached += 1;
@@ -327,6 +332,7 @@ impl Linker {
         let tmp_entry = self.virtual_store.join(&tmp_name);
 
         let result = self.materialize_at(
+            graph,
             &tmp_entry,
             &self.virtual_store,
             dep_path,
@@ -392,6 +398,7 @@ impl Linker {
     /// graph identity.
     pub(crate) fn reconcile_virtual_store_entry(
         &self,
+        graph: &LockfileGraph,
         dep_path: &str,
         pkg: &LockedPackage,
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
@@ -400,7 +407,8 @@ impl Linker {
             .virtual_store
             .join(self.virtual_store_subdir(dep_path))
             .join("node_modules");
-        let targets = self.virtual_store_dep_link_targets(dep_path, pkg, nested_link_targets)?;
+        let targets =
+            self.virtual_store_dep_link_targets(graph, dep_path, pkg, nested_link_targets)?;
         for (dep_name, target) in &targets {
             let symlink_path = pkg_nm_parent.join(dep_name);
             if reconcile_dir_link(&symlink_path, target)? {
@@ -422,6 +430,7 @@ impl Linker {
     /// phase's record of what it left on disk.
     pub(crate) fn virtual_store_dep_link_targets(
         &self,
+        graph: &LockfileGraph,
         #[cfg_attr(windows, allow(unused_variables))] dep_path: &str,
         pkg: &LockedPackage,
         nested_link_targets: Option<&BTreeMap<String, PathBuf>>,
@@ -437,7 +446,7 @@ impl Linker {
                 continue;
             }
             validate_package_link_name(dep_name)?;
-            let dep_dep_path = dependency_link_key(dep_name, dep_version);
+            let dep_dep_path = self.dependency_link_key(graph, dep_name, dep_version);
             let target = if let Some(abs_target) =
                 nested_link_targets.and_then(|targets| targets.get(&dep_dep_path))
             {
@@ -469,12 +478,19 @@ impl Linker {
         Ok(targets)
     }
 
+    fn dependency_link_key(&self, graph: &LockfileGraph, name: &str, tail: &str) -> String {
+        aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            .unwrap_or_else(|| dependency_link_key(name, tail))
+    }
+
     /// Materialize a per-project `.aube` entry. Under `--force` an existing
     /// entry is set aside first and only deleted once the replacement is
     /// complete; if materializing fails, the partial entry is dropped and
     /// the original is restored.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_replacing(
         &self,
+        graph: &LockfileGraph,
         aube_dir: &Path,
         dep_path: &str,
         pkg: &LockedPackage,
@@ -491,6 +507,7 @@ impl Linker {
             None
         };
         let result = self.materialize_at(
+            graph,
             entry,
             aube_dir,
             dep_path,
@@ -526,8 +543,10 @@ impl Linker {
     /// shareable, so shared dependents can link to the same global paths.
     /// Project-relative sources and their dependents instead materialize
     /// per-project with `apply_hashes = false`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ensure_shared_local_in_global_store(
         &self,
+        graph: &LockfileGraph,
         aube_dir: &Path,
         dep_path: &str,
         pkg: &LockedPackage,
@@ -539,11 +558,11 @@ impl Linker {
         let global_entry = self.virtual_store.join(self.virtual_store_subdir(dep_path));
         let state = self.forced_entry_state(classify_entry_state(&local_aube_entry, &global_entry));
         if matches!(state, EntryState::Fresh) {
-            self.reconcile_virtual_store_entry(dep_path, pkg, nested_link_targets)?;
+            self.reconcile_virtual_store_entry(graph, dep_path, pkg, nested_link_targets)?;
             stats.packages_cached += 1;
             return Ok(());
         }
-        self.ensure_in_virtual_store(dep_path, pkg, index, stats, nested_link_targets)?;
+        self.ensure_in_virtual_store(graph, dep_path, pkg, index, stats, nested_link_targets)?;
         if matches!(state, EntryState::Stale) {
             // A prior install — or an older aube that always
             // materialized git/remote sources per-project — may have
@@ -572,8 +591,10 @@ impl Linker {
     /// install-time materializer to pipeline the link work into the
     /// fetch phase under non-GVS mode, so the dedicated link phase only
     /// has to create top-level `node_modules/<name>` symlinks.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_in_aube_dir(
         &self,
+        graph: &LockfileGraph,
         aube_dir: &Path,
         dep_path: &str,
         pkg: &LockedPackage,
@@ -591,6 +612,7 @@ impl Linker {
         let tmp_name = materialize_tmp_name();
         let tmp_entry = aube_dir.join(&tmp_name);
         let result = self.materialize_at(
+            graph,
             &tmp_entry,
             aube_dir,
             dep_path,
@@ -648,6 +670,7 @@ impl Linker {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn materialize_at(
         &self,
+        graph: &LockfileGraph,
         entry_dir: &Path,
         final_base_dir: &Path,
         dep_path: &str,
@@ -836,7 +859,7 @@ impl Linker {
         // a per-project `.aube/<dep_path>` that the caller just
         // ensured is empty), so nothing can be in the way.
         for (dep_name, dep_version) in &pkg.dependencies {
-            let dep_dep_path = dependency_link_key(dep_name, dep_version);
+            let dep_dep_path = self.dependency_link_key(graph, dep_name, dep_version);
             // Skip any dep whose name matches the package being
             // materialized, regardless of version. The symlink would
             // land at `pkg_nm_parent.join(dep_name)` which is exactly
@@ -1274,10 +1297,7 @@ fn is_safe_package_component(component: &str) -> bool {
 // Keep serialized file: edges intact for lockfile reuse. Only link targets
 // use the path-hashed key, shared by local directories and tarballs.
 pub(crate) fn dependency_link_key(name: &str, tail: &str) -> String {
-    if let Some(path) = tail.split('(').next().and_then(|s| s.strip_prefix("file:")) {
-        return LocalSource::Directory(path.into()).dep_path(name);
-    }
-    shared_local_dep_path(name, tail).unwrap_or_else(|| format!("{name}@{tail}"))
+    local_dep_path(name, tail).unwrap_or_else(|| format!("{name}@{tail}"))
 }
 
 #[cfg(test)]
