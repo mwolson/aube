@@ -418,3 +418,27 @@ pub(super) fn write_cached_full_packument<T: Serialize>(
     .map_err(std::io::Error::other)?;
     aube_util::fs_atomic::atomic_write(path, &json)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cached_string_bin_sentinels_survive_rewrite() {
+        for name in ["string-cli", "@fixture/metadata"] {
+            let legacy = serde_json::json!({
+                "etag":null, "last_modified":null, "fetched_at":1,
+                "packument":{"name":name,"versions":{"1.0.0":{
+                    "name":name,"version":"1.0.0","bin":{"":"./cli.js"}
+                }}}
+            });
+            let cached: CachedPackument =
+                sonic_rs::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let metadata = &cached.packument.versions["1.0.0"];
+            assert_eq!(metadata.bin.get("").map(String::as_str), Some("./cli.js"));
+            let rewritten = sonic_rs::to_vec(&cached).unwrap();
+            let back: CachedPackument = sonic_rs::from_slice(&rewritten).unwrap();
+            assert_eq!(back.packument.versions["1.0.0"].bin, metadata.bin);
+        }
+    }
+}

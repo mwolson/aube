@@ -90,10 +90,7 @@ fn ref_bin_map(v: &Value) -> BTreeMap<String, String> {
         }
         Value::Object(m) => m
             .iter()
-            .filter_map(|(k, v)| match v {
-                Value::String(s) => Some((k.clone(), s.clone())),
-                _ => None,
-            })
+            .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
             .collect(),
         _ => BTreeMap::new(),
     }

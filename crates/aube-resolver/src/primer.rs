@@ -85,6 +85,7 @@ impl PrimerVersionMetadata {
             engines: self.engines.clone(),
             license: self.license.clone(),
             funding_url: self.funding_url.clone(),
+            funding: None,
             bin: self.bin.clone(),
             has_install_script: self.has_install_script,
             deprecated: self.deprecated.clone(),

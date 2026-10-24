@@ -1044,11 +1044,8 @@ fn test_parse_npm_preserves_platform_optional_metadata() {
     );
 }
 
-/// npm sometimes emits `os` / `cpu` / `libc` as scalar strings instead
-/// of arrays (e.g. `sass-embedded-linux-arm@1.99.0` ships
-/// `"libc": "glibc"`). Verbatim-roundtripped into package-lock.json,
-/// the field stays scalar — accept both shapes the same way the
-/// pnpm + bun parsers already do.
+/// Accept scalar platform constraints as well as arrays. Existing libc
+/// fields keep their original shape; new entries follow the project's npm.
 #[test]
 fn parse_npm_package_platform_fields_accept_scalar_strings() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1160,7 +1157,8 @@ fn test_write_npm_preserves_platform_optional_metadata() {
     let native = &json["packages"]["node_modules/native-win"];
     assert_eq!(native["os"], serde_json::json!(["win32"]));
     assert_eq!(native["cpu"], serde_json::json!(["x64"]));
-    assert_eq!(native["libc"], serde_json::json!(["glibc"]));
+    assert!(native.get("libc").is_none());
+    assert_eq!(graph.packages["native-win@1.0.0"].libc[0], "glibc");
 
     let reparsed = parse(out.path()).unwrap();
     let host = &reparsed.packages["host@1.0.0"];
@@ -1183,10 +1181,145 @@ fn test_write_npm_preserves_platform_optional_metadata() {
         native.cpu.iter().map(String::as_str).collect::<Vec<_>>(),
         vec!["x64"]
     );
-    assert_eq!(
-        native.libc.iter().map(String::as_str).collect::<Vec<_>>(),
-        vec!["glibc"]
-    );
+    assert!(native.libc.is_empty());
+}
+
+#[test]
+fn npm_new_entries_follow_project_libc_convention() {
+    use serde_json::json;
+
+    for (filename, manager, existing_libc, expected) in [
+        ("package-lock.json", None, None, false),
+        ("package-lock.json", Some("pnpm@12.14.0"), None, false),
+        ("package-lock.json", Some("npm@11.6.2"), None, false),
+        ("package-lock.json", Some("npm@11.10.1"), None, false),
+        ("package-lock.json", Some("npm@11.11.0-rc.0"), None, false),
+        ("package-lock.json", Some("npm@11.11"), None, false),
+        ("package-lock.json", Some("npm@latest"), None, false),
+        ("package-lock.json", Some("npm@v11.12.0"), None, false),
+        ("package-lock.json", Some("npm@V11.12.0"), None, false),
+        ("package-lock.json", Some("npm@v 11.12.0"), None, false),
+        ("package-lock.json", Some("npm@V\t11.12.0"), None, false),
+        ("package-lock.json", Some("npm@ 11.12.0"), None, false),
+        ("package-lock.json", Some("npm@\t11.12.0"), None, false),
+        ("package-lock.json", Some("npm@11.12.0 "), None, false),
+        ("package-lock.json", Some("npm@011.12.0"), None, false),
+        ("package-lock.json", Some("npm@11.12.0rc.0"), None, false),
+        ("package-lock.json", Some("npm@11.12.0+"), None, false),
+        ("package-lock.json", Some("npm@^11.11.0"), None, false),
+        ("package-lock.json", Some("npm@11.11.0"), None, true),
+        (
+            "package-lock.json",
+            Some("npm@11.11.0+sha512.abc"),
+            None,
+            true,
+        ),
+        (
+            "package-lock.json",
+            Some("npm@11.12.0-rc.0+001"),
+            None,
+            true,
+        ),
+        ("package-lock.json", Some("npm@11.20.0"), None, true),
+        ("package-lock.json", Some("npm@12.2.1"), None, true),
+        ("package-lock.json", None, Some(json!(["musl"])), true),
+        (
+            "package-lock.json",
+            Some("npm@11.6.2"),
+            Some(json!([])),
+            true,
+        ),
+        (
+            "package-lock.json",
+            Some("pnpm@12.14.0"),
+            Some(json!("musl")),
+            true,
+        ),
+        ("npm-shrinkwrap.json", None, None, false),
+        ("npm-shrinkwrap.json", Some("npm@11.6.2"), None, false),
+        ("npm-shrinkwrap.json", Some("npm@11.11.0"), None, true),
+        ("npm-shrinkwrap.json", Some("npm@11.20.0"), None, true),
+        ("npm-shrinkwrap.json", None, Some(json!(["musl"])), true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(filename);
+        let mut source = json!({"lockfileVersion":3,"packages":{
+            "": {"dependencies":{"old":"1.0.0"}},
+            "node_modules/old":{"version":"1.0.0"}
+        }});
+        if let Some(libc) = &existing_libc {
+            source["packages"]["node_modules/old"]["libc"] = libc.clone();
+        }
+        std::fs::write(&path, serde_json::to_vec(&source).unwrap()).unwrap();
+        let mut graph = parse(&path).unwrap();
+        // Platform data refreshed during resolution must not add a field to an imported entry.
+        graph.packages.get_mut("old@1.0.0").unwrap().libc = vec!["musl".into()].into();
+        graph.packages.insert(
+            "new@1.0.0".into(),
+            LockedPackage {
+                name: "new".into(),
+                version: "1.0.0".into(),
+                dep_path: "new@1.0.0".into(),
+                libc: vec!["glibc".into()].into(),
+                ..Default::default()
+            },
+        );
+        graph.importers.get_mut(".").unwrap().push(DirectDep {
+            name: "new".into(),
+            dep_path: "new@1.0.0".into(),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".into()),
+        });
+        let mut manifest: aube_manifest::PackageJson = serde_json::from_value(json!({
+            "dependencies":{"old":"1.0.0", "new":"1.0.0"}
+        }))
+        .unwrap();
+        if let Some(manager) = manager {
+            manifest
+                .extra
+                .insert("packageManager".into(), manager.into());
+        }
+        write(&path, &graph, &manifest).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["packages"]["node_modules/new"].get("libc"),
+            expected.then(|| json!(["glibc"])).as_ref(),
+            "{filename} {manager:?} {existing_libc:?}"
+        );
+        assert_eq!(
+            written["packages"]["node_modules/old"].get("libc"),
+            existing_libc.as_ref()
+        );
+        assert_eq!(graph.packages["new@1.0.0"].libc[0], "glibc");
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn npm_existing_libc_fields_roundtrip_verbatim(
+        libc in proptest::sample::select(vec![None, Some(serde_json::json!([])), Some(serde_json::json!("glibc")), Some(serde_json::json!(["musl"]))]),
+        modern_npm in proptest::bool::ANY,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("package-lock.json");
+        let output_path = dir.path().join("copy.json");
+        let mut source = serde_json::json!({"lockfileVersion":3,"packages":{
+            "": {"dependencies":{"old":"1.0.0"}},
+            "node_modules/old":{"version":"1.0.0"}
+        }});
+        if let Some(libc) = &libc {
+            source["packages"]["node_modules/old"]["libc"] = libc.clone();
+        }
+        std::fs::write(&source_path, serde_json::to_vec(&source).unwrap()).unwrap();
+        let mut graph = parse(&source_path).unwrap();
+        graph.packages.get_mut("old@1.0.0").unwrap().libc = vec!["glibc".into()].into();
+        let mut manifest: aube_manifest::PackageJson = serde_json::from_value(source["packages"][""].clone()).unwrap();
+        manifest.extra.insert("packageManager".into(), if modern_npm { "npm@11.20.0" } else { "npm@11.6.2" }.into());
+        write(&output_path, &graph, &manifest).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+        proptest::prop_assert_eq!(written["packages"]["node_modules/old"].get("libc"), libc.as_ref());
+    }
 }
 
 /// Regression: `canonical_key_from_dep_path` must strip the
@@ -4167,5 +4300,77 @@ fn test_write_absolute_directory_targets_relative_to_lockfile() {
             .find(|pkg| pkg.name == "child")
             .unwrap();
         assert_eq!(child.local_source, Some(LocalSource::Link(target.into())));
+    }
+}
+
+#[test]
+fn npm_writer_normalizes_bin_names_and_paths() {
+    for (name, input, expected) in [
+        (
+            "@fixture/metadata",
+            serde_json::json!("./cli.js"),
+            serde_json::json!({"metadata":"cli.js"}),
+        ),
+        (
+            "plain",
+            serde_json::json!("../cli.js"),
+            serde_json::json!({"plain":"cli.js"}),
+        ),
+        (
+            "plain",
+            serde_json::json!({
+                "@scope/tool":"./lib/../cli.js", "../escaped":"../../bin/run.js",
+                "C:\\tool.exe":".\\bin\\run.js", ".":"bad", "..":"bad",
+                "empty":"./", "":"bad", "__proto__":"bad", "invalid":false,
+                "absolute":"/usr//bin/run.js"
+            }),
+            serde_json::json!({"tool":"cli.js", "escaped":"bin/run.js",
+                "tool.exe":"bin/run.js", "absolute":"usr/bin/run.js"}),
+        ),
+    ] {
+        let bin = if let Some(path) = input.as_str() {
+            BTreeMap::from([(
+                name.rsplit('/').next().unwrap().to_string(),
+                path.to_string(),
+            )])
+        } else {
+            input
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter_map(|(key, value)| {
+                    (!key.is_empty()).then_some((key.clone(), value.as_str()?.to_string()))
+                })
+                .collect()
+        };
+        let pkg = LockedPackage {
+            name: name.into(),
+            version: "1.0.0".into(),
+            dep_path: format!("{name}@1.0.0"),
+            bin,
+            ..Default::default()
+        };
+        let mut graph = LockfileGraph::default();
+        graph.importers.insert(
+            ".".into(),
+            vec![DirectDep {
+                name: name.into(),
+                dep_path: pkg.dep_path.clone(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".into()),
+            }],
+        );
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+        let dir = tempfile::tempdir().unwrap();
+        for filename in ["package-lock.json", "npm-shrinkwrap.json"] {
+            let path = dir.path().join(filename);
+            write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+            let output: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                output["packages"][format!("node_modules/{name}")]["bin"],
+                expected
+            );
+        }
     }
 }
