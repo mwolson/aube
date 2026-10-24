@@ -303,6 +303,11 @@ pub fn write_with_project_root(
             }
             _ => reference.to_string(),
         };
+        // A bare reference to a contextualized provider is pnpm's cycle
+        // identity. Its patch hash belongs on the snapshot edge, not this pair.
+        if reference == head && !graph.packages.contains_key(reference) {
+            return Some(translated);
+        }
         let hash = patch_hashes
             .get(head)
             .map(String::as_str)
@@ -404,6 +409,10 @@ pub fn write_with_project_root(
                             "link:{}",
                             relative_to_importer(path, importer_path, &project_root)
                         )
+                    }
+                    LocalSource::Directory(_) | LocalSource::Tarball(_) => {
+                        let suffix = dep.dep_path.find('(').map_or("", |i| &dep.dep_path[i..]);
+                        format!("{}{suffix}", local.specifier())
                     }
                     _ => local.specifier(),
                 }
@@ -878,7 +887,13 @@ pub fn write_with_project_root(
                 let rewritten = if let Some(target) = target
                     && let Some(ref local) = target.local_source
                 {
-                    local.specifier()
+                    let suffix =
+                        if matches!(local, LocalSource::Directory(_) | LocalSource::Tarball(_)) {
+                            dp.find('(').map_or("", |i| &dp[i..])
+                        } else {
+                            ""
+                        };
+                    format!("{}{suffix}", local.specifier())
                 } else if target.is_none()
                     && let Some(member) = workspace_links.get(&dp)
                 {
@@ -905,6 +920,10 @@ pub fn write_with_project_root(
         // parser lines them up with the packages entry above.
         let mut key = match pkg.local_source.as_ref() {
             Some(LocalSource::Link(_)) | Some(LocalSource::Exec(_)) => continue,
+            Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) => {
+                let suffix = dep_path.find('(').map_or("", |i| &dep_path[i..]);
+                format!("{}@{}{suffix}", pkg.name, local.specifier())
+            }
             Some(local) => format!("{}@{}", pkg.name, local.specifier()),
             None => {
                 if native_pnpm_aliases && let Some(real_name) = pkg.alias_of.as_deref() {

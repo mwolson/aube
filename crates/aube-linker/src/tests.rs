@@ -457,19 +457,30 @@ fn staged_entries_preserve_scoped_links_and_clean_failed_writes() {
         } else {
             dir.path().join("project/node_modules/.aube")
         };
-        let graph = make_graph();
+        let mut graph = make_graph();
         let mut foo = graph.packages["foo@1.0.0"].clone();
         foo.dependencies.clear();
         foo.dependencies.insert("@scope/bar".into(), "2.0.0".into());
         let mut bar = graph.packages["bar@2.0.0"].clone();
         bar.name = "@scope/bar".into();
         bar.dep_path = "@scope/bar@2.0.0".into();
+        graph.packages.remove("bar@2.0.0");
+        graph.packages.insert(foo.dep_path.clone(), foo.clone());
+        graph.packages.insert(bar.dep_path.clone(), bar.clone());
         let place = |pkg: &LockedPackage, index: &PackageIndex| {
             let mut stats = LinkStats::default();
             if global {
-                linker.ensure_in_virtual_store(&pkg.dep_path, pkg, index, &mut stats, None)
+                linker.ensure_in_virtual_store(&graph, &pkg.dep_path, pkg, index, &mut stats, None)
             } else {
-                linker.ensure_in_aube_dir(&root, &pkg.dep_path, pkg, index, &mut stats, None)
+                linker.ensure_in_aube_dir(
+                    &graph,
+                    &root,
+                    &pkg.dep_path,
+                    pkg,
+                    index,
+                    &mut stats,
+                    None,
+                )
             }
         };
         place(&foo, &indices["foo@1.0.0"]).unwrap();
@@ -561,7 +572,15 @@ fn test_ensure_in_aube_dir_handles_concurrent_same_dep_path() {
                 barrier.wait();
                 let mut stats = LinkStats::default();
                 linker
-                    .ensure_in_aube_dir(&aube_dir, "debug@4.4.0", &pkg, &index, &mut stats, None)
+                    .ensure_in_aube_dir(
+                        &make_graph(),
+                        &aube_dir,
+                        "debug@4.4.0",
+                        &pkg,
+                        &index,
+                        &mut stats,
+                        None,
+                    )
                     .expect("duplicate materialization should be idempotent");
                 stats
             })
@@ -1219,6 +1238,7 @@ fn small_reflink_preserves_permissions_and_isolates_writes() {
                 let _forced = force_failure.then(ForcedReflinkFailure::engage);
                 linker
                     .materialize_at(
+                        &make_graph(),
                         &base.join("foo@1.0.0"),
                         &base,
                         "foo@1.0.0",
@@ -1404,7 +1424,7 @@ fn cached_entry_repair_rejects_dependency_path_escape() {
 
     assert!(
         linker
-            .reconcile_virtual_store_entry("foo@1.0.0", &pkg, None)
+            .reconcile_virtual_store_entry(&make_graph(), "foo@1.0.0", &pkg, None)
             .is_err()
     );
     assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep");
@@ -2799,16 +2819,24 @@ fn local_peer_dependents_stay_in_each_project() {
 
     for gvs in [false, true] {
         for workspace in [false, true] {
-            for source in [
-                LocalSource::Directory("app/deps/react".into()),
-                LocalSource::Tarball("app/deps/react.tgz".into()),
-                LocalSource::Link("app/deps/react".into()),
+            for (source, suffix) in [
+                (LocalSource::Directory("app/deps/react".into()), ""),
+                (LocalSource::Tarball("app/deps/react.tgz".into()), ""),
+                (LocalSource::Link("app/deps/react".into()), ""),
+                (
+                    LocalSource::Directory("app/deps/react".into()),
+                    "(bar@2.0.0)",
+                ),
+                (
+                    LocalSource::Tarball("app/deps/react.tgz".into()),
+                    "(bar@2.0.0)",
+                ),
             ] {
                 let dir = tempfile::tempdir().unwrap();
                 let (store, mut indices) = setup_store_with_files(dir.path());
-                let peer_key = source.dep_path("react");
+                let peer_key = format!("{}{suffix}", source.dep_path("react"));
                 let peer_edge = match &source {
-                    LocalSource::Directory(_) => "file:app/deps/./react".to_string(),
+                    LocalSource::Directory(_) => format!("file:app/deps/./react{suffix}"),
                     LocalSource::Tarball(_) => "file:app/deps/react.tgz(bar@2.0.0)".to_string(),
                     _ => peer_key[6..].to_string(),
                 };
@@ -2891,9 +2919,13 @@ fn local_peer_dependents_stay_in_each_project() {
                     aube_lockfile::graph_hash::compute_graph_hashes(&graph, &|_| false, None);
                 let mut installed_peers = Vec::new();
                 for generation in ["first", "second"] {
-                    let linker = Linker::new_with_gvs(&store, LinkStrategy::Copy, gvs)
-                        .with_hoist(false)
-                        .with_graph_hashes(hashes.clone());
+                    let linker =
+                        Linker::new_with_gvs(&store, LinkStrategy::Copy, gvs).with_hoist(false);
+                    let linker = if gvs {
+                        linker.with_graph_hashes(hashes.clone())
+                    } else {
+                        linker
+                    };
                     let linker = if generation == "second" {
                         linker.with_precomputed_project_local_dep_paths(std::sync::Arc::new(
                             project_local_dependency_closure(&graph),
