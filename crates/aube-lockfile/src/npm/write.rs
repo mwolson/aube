@@ -36,6 +36,8 @@ struct WriteNpmPackage<'a> {
     license: Option<&'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<&'a str, &'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    bundle_dependencies: Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     dev_dependencies: BTreeMap<&'a str, &'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -68,6 +70,8 @@ struct WriteNpmPackage<'a> {
     workspaces: Option<&'a aube_manifest::Workspaces>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     link: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    peer: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     dev: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -158,6 +162,7 @@ pub fn write(
         .values()
         .flat_map(|deps| deps.iter().cloned())
         .collect();
+    let non_peer_reach = non_peer_reachable(&canonical, &all_roots);
     let prod_reach = reachable_from(&canonical, &all_roots, DepType::Production, true);
     let dev_reach = reachable_from(&canonical, &all_roots, DepType::Dev, false);
     let dev_required_reach = reachable_from(&canonical, &all_roots, DepType::Dev, true);
@@ -168,11 +173,11 @@ pub fn write(
     // `["foo", "bar"]` for `node_modules/foo/node_modules/bar`. Shared
     // with bun (which renders the same segment list as `foo/bar`).
     let root_tree_roots = non_link_roots(graph, &roots);
-    let preferred_roots = preferred_root_placements(path, &canonical);
+    let preferred_placements = preferred_placements(path, &canonical);
     let tree = super::build_hoist_tree(
         &canonical,
         &root_tree_roots,
-        Some(&preferred_roots),
+        Some(&preferred_placements),
         &BTreeSet::new(),
     );
     // For the npm writer, re-key the tree by install_path strings.
@@ -376,10 +381,13 @@ pub fn write(
         // treats that as a corrupt lockfile, and `npm install`
         // would refetch the dropped package. Matches the bun and
         // yarn writers, which filter the same way.
-        let optional_deps: BTreeMap<&str, &str> = pkg
+        let mut optional_deps: BTreeMap<&str, &str> = pkg
             .optional_dependencies
             .iter()
-            .filter(|(n, value)| canonical.contains_key(&super::child_canonical_key(n, value)))
+            .filter(|(n, value)| {
+                is_declared_dependency(pkg, n)
+                    && canonical.contains_key(&super::child_canonical_key(n, value))
+            })
             .map(|(n, value)| {
                 // Prefer the declared range from the package's own
                 // manifest (what npm itself writes) over the resolved
@@ -394,11 +402,12 @@ pub fn write(
                 (n.as_str(), rendered)
             })
             .collect();
-        let deps: BTreeMap<&str, &str> = pkg
+        let mut deps: BTreeMap<&str, &str> = pkg
             .dependencies
             .iter()
             .filter(|(n, value)| {
-                !pkg.optional_dependencies.contains_key(*n)
+                is_declared_dependency(pkg, n)
+                    && !pkg.optional_dependencies.contains_key(*n)
                     && canonical.contains_key(&super::child_canonical_key(n, value))
             })
             .map(|(n, value)| {
@@ -410,6 +419,22 @@ pub fn write(
                 (n.as_str(), rendered)
             })
             .collect();
+
+        // Bundled dependencies have declarations but no separately resolved edges.
+        for name in &pkg.bundled_dependencies {
+            if let Some(spec) = pkg.declared_dependencies.get(name) {
+                if pkg
+                    .extra_meta
+                    .get(super::raw::BUNDLED_OPTIONAL_KEY)
+                    .and_then(|optional| optional.get(name))
+                    .is_some()
+                {
+                    optional_deps.insert(name, spec);
+                } else {
+                    deps.insert(name, spec);
+                }
+            }
+        }
 
         // npm v3 flag semantics:
         //   prod-reachable     → neither flag
@@ -439,6 +464,16 @@ pub fn write(
         } else {
             (false, false, false)
         };
+
+        let ordinary = non_peer_reach.contains(canonical_key);
+        let peer = pkg
+            .extra_meta
+            .get(super::raw::NON_PEER_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .filter(|before| *before == ordinary)
+            .and_then(|_| pkg.extra_meta.get(super::raw::PEER_KEY))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(!ordinary);
 
         // Aliased deps (`"h3-v2": "npm:h3@..."` in package.json)
         // round-trip as `node_modules/h3-v2` with an explicit
@@ -499,6 +534,7 @@ pub fn write(
                     name: Some(pkg.name.as_str()),
                     version: Some(pkg.version.as_str()),
                     dependencies: deps,
+                    bundle_dependencies: pkg.bundled_dependencies.clone(),
                     optional_dependencies: optional_deps,
                     peer_dependencies: peer_deps,
                     peer_dependencies_meta: peer_deps_meta,
@@ -532,12 +568,14 @@ pub fn write(
             install_path.clone(),
             WriteNpmPackage {
                 name: alias_name,
+                peer,
                 version: Some(pkg.version.as_str()),
                 resolved,
                 integrity: pkg.integrity.as_deref(),
                 has_install_script: has_install_script(pkg),
                 license: pkg.license.as_deref(),
                 dependencies: deps,
+                bundle_dependencies: pkg.bundled_dependencies.clone(),
                 optional_dependencies: optional_deps,
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_deps_meta,
@@ -573,6 +611,18 @@ pub fn write(
     };
 
     let mut value = serde_json::to_value(&doc).map_err(|e| Error::parse(path, e.to_string()))?;
+    for (install_path, canonical_key) in &placed {
+        if let Some(entries) = canonical
+            .get(canonical_key)
+            .and_then(|pkg| pkg.extra_meta.get(super::raw::BUNDLED_ENTRIES_KEY))
+            .and_then(serde_json::Value::as_object)
+        {
+            let owner = &value["packages"][install_path];
+            for (suffix, entry) in bundled_entries(owner, entries) {
+                value["packages"][format!("{install_path}{suffix}")] = entry;
+            }
+        }
+    }
     sort_keys_like_npm(&mut value);
     let mut body =
         serde_json::to_string_pretty(&value).map_err(|e| Error::parse(path, e.to_string()))?;
@@ -685,14 +735,11 @@ fn locale_compare_en(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
-/// Read npm's existing top-level install choices before replacing the file.
-/// This is best-effort: new destinations and malformed files have no layout
-/// preference, while the caller's normal parse path remains responsible for
-/// surfacing errors from an existing project lockfile.
-fn preferred_root_placements(
+/// Keep npm's existing placements when their resolved identities still exist.
+fn preferred_placements(
     path: &Path,
     canonical: &BTreeMap<String, &LockedPackage>,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<Vec<String>, String> {
     let Ok(content) = crate::read_lockfile(path) else {
         return BTreeMap::new();
     };
@@ -707,9 +754,6 @@ fn preferred_root_placements(
         let Some(rest) = install_path.strip_prefix("node_modules/") else {
             continue;
         };
-        if rest.contains("/node_modules/") {
-            continue;
-        }
         let Some(name) = super::layout::package_name_from_install_path(&install_path) else {
             continue;
         };
@@ -718,7 +762,10 @@ fn preferred_root_placements(
         };
         let key = format!("{name}@{version}");
         if canonical.contains_key(&key) {
-            preferred.insert(name, key);
+            preferred.insert(
+                rest.split("/node_modules/").map(str::to_owned).collect(),
+                key,
+            );
         }
     }
     preferred
@@ -848,7 +895,7 @@ fn reachable_from(
             continue;
         };
         for (child_name, child_value) in &pkg.dependencies {
-            if required_edges_only && pkg.optional_dependencies.contains_key(child_name) {
+            if required_edges_only && is_optional_edge(pkg, child_name) {
                 continue;
             }
             let child_key = super::child_canonical_key(child_name, child_value);
@@ -897,7 +944,7 @@ fn optional_reach(
         };
         for (child_name, child_value) in &pkg.dependencies {
             let child_key = super::child_canonical_key(child_name, child_value);
-            if pkg.optional_dependencies.contains_key(child_name) {
+            if is_optional_edge(pkg, child_name) {
                 enqueue(child_key, &mut queue);
             } else if canonical.contains_key(&child_key) && required_seen.insert(child_key.clone())
             {
@@ -930,4 +977,125 @@ fn optional_peers_meta<'a>(
 
 fn borrow_map(m: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
     m.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+pub(super) fn non_peer_reachable(
+    canonical: &BTreeMap<String, &LockedPackage>,
+    roots: &[DirectDep],
+) -> BTreeSet<String> {
+    let mut reached = BTreeSet::new();
+    let mut queue: VecDeque<String> = roots
+        .iter()
+        .map(|dep| super::canonical_key_from_dep_path(&dep.dep_path))
+        .collect();
+    while let Some(key) = queue.pop_front() {
+        if !reached.insert(key.clone()) {
+            continue;
+        }
+        if let Some(pkg) = canonical.get(&key) {
+            for (name, value) in &pkg.dependencies {
+                if is_declared_dependency(pkg, name) {
+                    queue.push_back(super::child_canonical_key(name, value));
+                }
+            }
+        }
+    }
+    reached
+}
+
+// Resolved peers are runtime edges, but npm serializes only declared deps.
+fn is_declared_dependency(pkg: &LockedPackage, name: &str) -> bool {
+    if pkg.declared_dependencies_known() {
+        pkg.declared_dependencies.contains_key(name)
+    } else {
+        !pkg.peer_dependencies.contains_key(name) || pkg.declared_dependencies.contains_key(name)
+    }
+}
+
+fn is_optional_edge(pkg: &LockedPackage, name: &str) -> bool {
+    pkg.optional_dependencies.contains_key(name)
+        || !is_declared_dependency(pkg, name)
+            && pkg
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional)
+}
+
+// Bundled children share their owner's incoming paths, but their own optional
+// edges still matter when an owner moves between dependency sections.
+fn bundled_entries(
+    owner: &serde_json::Value,
+    entries: &serde_json::Map<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    let flag = |entry: &serde_json::Value, key: &str| entry[key].as_bool() == Some(true);
+    let mut queue = VecDeque::new();
+    if flag(owner, "devOptional") {
+        queue.push_back((String::new(), 1u8));
+        queue.push_back((String::new(), 2u8));
+    } else {
+        queue.push_back((
+            String::new(),
+            u8::from(flag(owner, "dev")) | (u8::from(flag(owner, "optional")) << 1),
+        ));
+    }
+    let mut reached: BTreeMap<String, BTreeSet<u8>> = BTreeMap::new();
+    while let Some((path, state)) = queue.pop_front() {
+        if !reached.entry(path.clone()).or_default().insert(state) {
+            continue;
+        }
+        let entry = if path.is_empty() {
+            owner
+        } else {
+            &entries[&path]
+        };
+        for section in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            let Some(deps) = entry[section].as_object() else {
+                continue;
+            };
+            for name in deps.keys() {
+                let optional = section == "optionalDependencies"
+                    || entry["optionalDependencies"].get(name).is_some()
+                    || section == "peerDependencies"
+                        && entry["dependencies"].get(name).is_none()
+                        && entry["peerDependenciesMeta"][name]["optional"].as_bool() == Some(true);
+                let child_state = state | if optional { 2 } else { 0 };
+                let mut base = path.as_str();
+                loop {
+                    let candidate = format!("{base}/node_modules/{name}");
+                    if entries.contains_key(&candidate) {
+                        queue.push_back((candidate, child_state));
+                        break;
+                    }
+                    let Some((parent, _)) = base.rsplit_once("/node_modules/") else {
+                        break;
+                    };
+                    base = parent;
+                }
+            }
+        }
+    }
+    entries
+        .iter()
+        .map(|(path, entry)| {
+            let mut entry = entry.clone();
+            if let Some(states) = reached.get(path) {
+                let dev = states.iter().all(|state| state & 1 != 0);
+                let optional = states.iter().all(|state| state & 2 != 0);
+                let dev_optional = !dev && !optional && !states.contains(&0);
+                if let Some(object) = entry.as_object_mut() {
+                    for (name, enabled) in [
+                        ("dev", dev),
+                        ("optional", optional),
+                        ("devOptional", dev_optional),
+                    ] {
+                        object.remove(name);
+                        if enabled {
+                            object.insert(name.into(), true.into());
+                        }
+                    }
+                }
+            }
+            (path.clone(), entry)
+        })
+        .collect()
 }
