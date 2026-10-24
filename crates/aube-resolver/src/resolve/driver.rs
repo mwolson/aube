@@ -306,6 +306,7 @@ impl<'a> ResolveDriver<'a> {
             self.resolved_times,
             self.skipped_optional_dependencies,
             self.catalog_picks,
+            self.existing,
         )?;
         if let Some((state, sem)) = self.packument_persist_handle {
             sem.persist(&state, "packument:default");

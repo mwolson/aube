@@ -404,46 +404,12 @@ pub fn mark_transitive_peer_dependencies(graph: &mut aube_lockfile::LockfileGrap
     let mut parents: FxHashMap<String, Vec<String>> = FxHashMap::default();
     let mut unresolved: FxHashMap<String, Vec<String>> = FxHashMap::default();
 
-    for (dep_path, pkg) in &graph.packages {
-        for (name, tail) in pkg
-            .dependencies
-            .iter()
-            .chain(pkg.optional_dependencies.iter())
-        {
-            // Skip resolved-peer edges. A dependency the package also
-            // declares as a peer (e.g. `eslint` inside an eslint plugin) is
-            // an injected peer, not an owned dependency — pnpm satisfies it
-            // from the consumer's context and does not bubble that peer's
-            // own transitive peers through the edge. Mirroring that keeps a
-            // plugin from inheriting `supports-color`/`typescript` purely
-            // because its injected `eslint`/`typescript` peer transitively
-            // depends on them.
-            if pkg.peer_dependencies.contains_key(name)
-                || pkg.peer_dependencies_meta.contains_key(name)
-            {
-                continue;
-            }
-            // Match `filter_graph`'s child-key convention (incl. the
-            // git/remote-tarball `name@url+<hash>` form) so peers bubble
-            // through git/tarball edges too.
-            if let Some(child) =
-                aube_lockfile::resolve_dep_edge(name, tail, |k| graph.packages.contains_key(k))
-            {
-                parents.entry(child).or_default().push(dep_path.clone());
-            } else {
-                // Edge points outside the resolved graph (workspace
-                // `link:`/`file:` deps, or a child pruned by platform
-                // filtering). It has no snapshot to bubble peers through,
-                // so dropping it is correct — log at debug for anyone
-                // chasing a missing `transitivePeerDependencies` entry.
-                tracing::debug!(
-                    parent = %dep_path,
-                    dep = %name,
-                    tail = %tail,
-                    "transitive-peer pass: dependency edge has no graph node, skipping"
-                );
-            }
+    for (parent, children) in crate::peer_context::peer_walk_children(graph) {
+        for child in children {
+            parents.entry(child).or_default().push(parent.clone());
         }
+    }
+    for (dep_path, pkg) in &graph.packages {
         // Declared peers plus pnpm's meta-only peers (the optional
         // `peerDependenciesMeta` keys, folded in as `*` by the helper —
         // e.g. debug's `supports-color`). A resolved peer is mirrored into
@@ -882,15 +848,16 @@ mod tests {
 
         mark_transitive_peer_dependencies(&mut graph);
 
-        // Each node collects the other's peer through the cycle but never its
-        // own — `a` doesn't list `pa`, `b` doesn't list `pb`.
+        // pnpm 12 walks a -> b and cuts b -> a. Only a inherits a peer,
+        // and neither node lists its own declaration as transitive.
         assert_eq!(
             graph.packages["a@1.0.0"].transitive_peer_dependencies,
             vec!["pb".to_string()]
         );
-        assert_eq!(
-            graph.packages["b@1.0.0"].transitive_peer_dependencies,
-            vec!["pa".to_string()]
+        assert!(
+            graph.packages["b@1.0.0"]
+                .transitive_peer_dependencies
+                .is_empty()
         );
     }
 
