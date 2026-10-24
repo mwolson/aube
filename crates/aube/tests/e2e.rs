@@ -1101,6 +1101,129 @@ fn check_transitive_local_package(tarball: bool, format: &str, lockfile_dir: &st
 }
 
 #[test]
+fn npm_workspace_local_specs_survive_clean_frozen_install() {
+    let _guard = e2e_lock();
+    for tarball in [false, true] {
+        for optional in [false, true] {
+            check_npm_local_child(true, tarball, optional);
+        }
+    }
+}
+
+fn check_npm_local_child(workspace: bool, tarball: bool, optional: bool) {
+    for linker in ["isolated", "hoisted"] {
+        for gvs in [false, true] {
+            let sbx = Sandbox::new();
+            let host = sbx.project.join("vendor/host");
+            let leaf = sbx.project.join("vendor/leaf");
+            fs::create_dir_all(&host).unwrap();
+            fs::create_dir_all(&leaf).unwrap();
+            fs::write(
+                leaf.join("package.json"),
+                r#"{"name":"leaf","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            fs::write(leaf.join("index.js"), "module.exports = 'leaf ok';").unwrap();
+            let leaf_path = if tarball {
+                let path = sbx.project.join("leaf.tgz");
+                let archive = fs::File::create(&path).unwrap();
+                let gzip = flate2::write::GzEncoder::new(archive, flate2::Compression::default());
+                let mut tar = tar::Builder::new(gzip);
+                tar.append_dir_all("package", &leaf).unwrap();
+                tar.into_inner().unwrap().finish().unwrap();
+                path
+            } else {
+                leaf
+            };
+            let section = if optional {
+                "optionalDependencies"
+            } else {
+                "dependencies"
+            };
+            let spec = format!("file:{}", leaf_path.display());
+            fs::write(
+                host.join("package.json"),
+                serde_json::json!({
+                    "name": "host", "version": "1.0.0", section: {"leaf": spec}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(host.join("index.js"), "module.exports = require('leaf');").unwrap();
+            let consumer = if workspace {
+                sbx.write_manifest(r#"{"name":"root","private":true,"workspaces":["apps/*"]}"#);
+                let app = sbx.project.join("apps/app");
+                fs::create_dir_all(&app).unwrap();
+                fs::write(
+                    app.join("package.json"),
+                    r#"{"name":"app","dependencies":{"host":"file:../../vendor/host"}}"#,
+                )
+                .unwrap();
+                app
+            } else {
+                sbx.write_manifest(
+                    r#"{"name":"root","private":true,"dependencies":{"host":"file:vendor/host"}}"#,
+                );
+                sbx.project.clone()
+            };
+            fs::write(
+                sbx.project.join("package-lock.json"),
+                r#"{"lockfileVersion":3,"packages":{"":{"name":"root"}}}"#,
+            )
+            .unwrap();
+            let mut fresh_lock = Vec::new();
+            for frozen in [false, true] {
+                sbx.cmd()
+                    .args(["install", "--ignore-scripts"])
+                    .arg(format!("--node-linker={linker}"))
+                    .arg(if gvs {
+                        "--enable-global-virtual-store"
+                    } else {
+                        "--disable-global-virtual-store"
+                    })
+                    .arg(if frozen {
+                        "--frozen-lockfile"
+                    } else {
+                        "--no-frozen-lockfile"
+                    })
+                    .assert()
+                    .success();
+                let output = std::process::Command::new("node")
+                    .current_dir(&consumer)
+                    .args(["-e", "console.log(require('host'))"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "workspace={workspace}, tarball={tarball}, optional={optional}, linker={linker}, gvs={gvs}, frozen={frozen}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "leaf ok");
+                let lock = fs::read(sbx.project.join("package-lock.json")).unwrap();
+                if frozen {
+                    assert_eq!(lock, fresh_lock, "frozen install rewrote lockfile");
+                } else {
+                    let parsed: serde_json::Value = serde_json::from_slice(&lock).unwrap();
+                    assert_eq!(parsed["packages"]["vendor/host"][section]["leaf"], spec);
+                    fresh_lock = lock;
+                    for dir in [
+                        sbx.project.join("node_modules"),
+                        consumer.join("node_modules"),
+                        host.join("node_modules"),
+                        sbx.project.join("vendor/leaf/node_modules"),
+                        sbx.store.clone(),
+                    ] {
+                        if dir.exists() {
+                            fs::remove_dir_all(dir).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn boolean_bundle_bins_survive_clean_frozen_pnpm_install() {
     let _guard = e2e_lock();
     let sbx = Sandbox::new();
