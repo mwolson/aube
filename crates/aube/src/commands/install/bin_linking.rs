@@ -1727,6 +1727,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scoped_string_bin_links_the_unscoped_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("node_modules/@fixture/metadata");
+        let bins = dir.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("cli.js"), "#!/usr/bin/env node\n").unwrap();
+        link_bin_entries(
+            &bins,
+            &package,
+            Some("@fixture/metadata"),
+            &serde_json::json!("./cli.js"),
+            aube_linker::BinShimOptions::default(),
+            &mut ManagedBinLinks::default(),
+            None,
+            BinConflict::Overwrite,
+        )
+        .unwrap();
+        assert!(bins.join("metadata").exists());
+        assert!(!bins.join("@fixture").exists());
+    }
+
     /// A shim left behind by a removed dependency must go, while shims the
     /// current install claims and files aube did not write stay put.
     #[test]

@@ -247,6 +247,14 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
                             serde_json::json!(package_entry.optional_dependencies),
                         )
                     }))
+                    .chain(
+                        package_entry
+                            .deprecated
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|msg| !msg.is_empty())
+                            .map(|msg| ("deprecated".to_string(), msg.into())),
+                    )
                     .chain(Some((
                         super::raw::PEER_KEY.to_string(),
                         package_entry.peer.into(),
