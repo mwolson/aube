@@ -1003,6 +1003,16 @@ fn npm_workspace_local_specs_survive_clean_frozen_install() {
     }
 }
 
+#[test]
+fn npm_linked_directory_children_survive_clean_frozen_install() {
+    let _guard = e2e_lock();
+    for tarball in [false, true] {
+        for optional in [false, true] {
+            check_npm_local_child(false, tarball, optional);
+        }
+    }
+}
+
 fn check_npm_local_child(workspace: bool, tarball: bool, optional: bool) {
     for linker in ["isolated", "hoisted"] {
         for gvs in [false, true] {
