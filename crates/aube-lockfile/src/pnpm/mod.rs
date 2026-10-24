@@ -1,5 +1,6 @@
 mod checksum;
 mod dep_path;
+mod environment;
 mod format;
 mod raw;
 mod read;

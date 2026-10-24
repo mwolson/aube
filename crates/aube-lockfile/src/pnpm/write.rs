@@ -198,6 +198,7 @@ pub fn write_with_project_root(
     graph: &LockfileGraph,
     manifest: &PackageJson,
 ) -> Result<(), Error> {
+    let environment = super::environment::read_for_write(path, manifest)?;
     let native_pnpm_aliases = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -969,6 +970,10 @@ pub fn write_with_project_root(
 
     let yaml = yaml_serde::to_string(&lockfile).map_err(|e| Error::parse(path, e.to_string()))?;
     let yaml = reformat_for_pnpm_parity(&yaml);
+    let yaml = match environment {
+        Some(environment) => environment + &yaml,
+        None => yaml,
+    };
     // Atomic via tempfile + persist. Crash, Ctrl+C, or AV
     // quarantine during the write used to leave the user with a
     // truncated pnpm-lock.yaml on disk, next install failed to
