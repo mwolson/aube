@@ -3485,6 +3485,115 @@ snapshots:
 }
 
 #[test]
+fn pnpm_patched_peer_cycle_keeps_bare_suffix_and_full_snapshot_edge() {
+    let yaml = r#"lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      consumer:
+        specifier: 1.0.0
+        version: 1.0.0(host@1.0.0)
+packages:
+  consumer@1.0.0:
+    peerDependencies:
+      host: '*'
+  host@1.0.0:
+    peerDependencies:
+      plugin: '*'
+  plugin@1.0.0:
+    peerDependencies:
+      host: '*'
+snapshots:
+  consumer@1.0.0(host@1.0.0):
+    dependencies:
+      host: 1.0.0(plugin@1.0.0)
+  host@1.0.0(plugin@1.0.0):
+    dependencies:
+      plugin: 1.0.0(host@1.0.0)
+  plugin@1.0.0(host@1.0.0):
+    dependencies:
+      host: 1.0.0(plugin@1.0.0)
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let mut graph = parse(&path).unwrap();
+    let hash = "b1440f165806cc9e359186de511d388b3a72b66339550e31daacb7cd51046293";
+    graph
+        .patched_dependencies
+        .insert("host@1.0.0".to_string(), hash.to_string());
+    write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("consumer@1.0.0(host@1.0.0):"), "{written}");
+    assert!(written.contains("plugin@1.0.0(host@1.0.0):"), "{written}");
+    assert!(
+        written.contains(&format!("host: 1.0.0(patch_hash={hash})(plugin@1.0.0)")),
+        "{written}"
+    );
+}
+
+#[test]
+fn pnpm_file_packages_keep_context_in_importers_snapshots_and_dependency_refs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pnpm-lock.yaml");
+    let mut graph = crate::LockfileGraph::default();
+    let leaf_key = "leaf@file+0123456789abcdef(peer@1.0.0)";
+    graph.importers.insert(
+        ".".to_string(),
+        vec![crate::DirectDep {
+            name: "leaf".to_string(),
+            dep_path: leaf_key.to_string(),
+            dep_type: crate::DepType::Production,
+            specifier: Some("file:leaf.tgz".to_string()),
+        }],
+    );
+    for pkg in [
+        crate::LockedPackage {
+            name: "leaf".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: leaf_key.to_string(),
+            local_source: Some(crate::LocalSource::Tarball("leaf.tgz".into())),
+            peer_dependencies: [("peer".to_string(), "*".to_string())].into(),
+            dependencies: [("peer".to_string(), "1.0.0".to_string())].into(),
+            ..Default::default()
+        },
+        crate::LockedPackage {
+            name: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "parent@1.0.0".to_string(),
+            dependencies: [(
+                "leaf".to_string(),
+                "file+0123456789abcdef(peer@1.0.0)".to_string(),
+            )]
+            .into(),
+            ..Default::default()
+        },
+        crate::LockedPackage {
+            name: "peer".to_string(),
+            version: "1.0.0".to_string(),
+            dep_path: "peer@1.0.0".to_string(),
+            ..Default::default()
+        },
+    ] {
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+    }
+    write_with_project_root(&path, dir.path(), &graph, &PackageJson::default()).unwrap();
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("version: file:leaf.tgz(peer@1.0.0)"),
+        "{written}"
+    );
+    assert!(
+        written.contains("leaf@file:leaf.tgz(peer@1.0.0):"),
+        "{written}"
+    );
+    assert!(
+        written.contains("leaf: file:leaf.tgz(peer@1.0.0)"),
+        "{written}"
+    );
+}
+
+#[test]
 fn pnpm_patch_hash_decorates_direct_transitive_and_peer_context_refs() {
     let yaml = r#"lockfileVersion: '9.0'
 
@@ -5698,7 +5807,7 @@ snapshots:
   {name}@{edge}: {{}}
 "#);
         std::fs::write(&path, input).unwrap();
-        let key = source.dep_path(&name);
+        let key = format!("{}{suffix}", source.dep_path(&name));
         for roundtrip in [false, true] {
             let graph = parse(&path).unwrap();
             proptest::prop_assert!(graph.packages.contains_key(&key), "roundtrip={roundtrip}");

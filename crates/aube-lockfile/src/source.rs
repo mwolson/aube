@@ -376,7 +376,8 @@ pub fn shared_local_dep_path(dep_name: &str, dep_value: &str) -> Option<String> 
 ///      (a content-pinned git/tarball child and everything under it
 ///      vanishes from the walk once the node is keyed canonically).
 ///   4. `file:` edges likewise target path-hashed directory/tarball keys.
-///      Preserve the specifier in the graph for resolver reuse.
+///      [`local_dep_path`] preserves peer context for all three source kinds.
+///      Importer-synthesized nodes may have only a bare key as a fallback.
 pub fn resolve_dep_edge(name: &str, tail: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
     if contains(tail) {
         return Some(tail.to_string());
@@ -385,19 +386,30 @@ pub fn resolve_dep_edge(name: &str, tail: &str, contains: impl Fn(&str) -> bool)
     if contains(&rejoined) {
         return Some(rejoined);
     }
-    if let Some(path) = tail.split('(').next().and_then(|s| s.strip_prefix("file:")) {
-        let key = LocalSource::Directory(path.into()).dep_path(name);
-        if let Some(index) = tail.find('(') {
-            let contextual = format!("{key}{}", &tail[index..]);
-            if contains(&contextual) {
-                return Some(contextual);
-            }
-        }
+    if let Some(key) = local_dep_path(name, tail) {
         if contains(&key) {
             return Some(key);
         }
+        let bare = key.split('(').next().unwrap_or(&key);
+        if contains(bare) {
+            return Some(bare.to_string());
+        }
     }
-    shared_local_dep_path(name, tail).filter(|key| contains(key))
+    None
+}
+
+/// Map a serialized file, git, or remote-tarball reference to its hashed
+/// graph key, retaining the target's peer context. Directory and tarball
+/// paths share the same `file` identity without consulting the filesystem.
+pub fn local_dep_path(name: &str, value: &str) -> Option<String> {
+    let (source, suffix) = value
+        .find('(')
+        .map_or((value, ""), |offset| (&value[..offset], &value[offset..]));
+    let key = match source.strip_prefix("file:") {
+        Some(path) => LocalSource::Directory(path.into()).dep_path(name),
+        None => shared_local_dep_path(name, source)?,
+    };
+    Some(format!("{key}{suffix}"))
 }
 
 /// Parse a git dependency specifier into `(clone_url, committish)`.
@@ -1160,6 +1172,18 @@ mod tests {
     }
 
     const SHARED_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    proptest::proptest! {
+        #[test]
+        fn file_edges_preserve_contextual_targets(path in "[a-z]{1,12}/[a-z]{1,12}\\.tgz", major in 1u16..100) {
+            let base = LocalSource::Directory(path.clone().into()).dep_path("react");
+            proptest::prop_assert_eq!(&base, &LocalSource::Tarball(path.clone().into()).dep_path("react"));
+            let contextual = format!("{base}(host@{major}.0.0)");
+            let edge = format!("file:./{path}(host@{major}.0.0)");
+            let target = resolve_dep_edge("react", &edge, |key| key == base || key == contextual);
+            proptest::prop_assert_eq!(target.as_deref(), Some(contextual.as_str()));
+        }
+    }
 
     /// The dep_path the lockfile parser keys a git package under, given
     /// its normalized clone URL and pinned commit.

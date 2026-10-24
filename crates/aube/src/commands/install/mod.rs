@@ -1321,7 +1321,7 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
                     ignore_scripts: opts.ignore_scripts,
                 },
                 read_package_hook,
-            );
+            )?;
 
             // Spawn the tarball fetch coordinator — it starts fetching as
             // packages arrive from the resolver, overlapping network I/O.
@@ -2334,12 +2334,12 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     maybe_cleanup_unused_catalogs(&cwd, &settings_ctx, &workspace_catalogs, &graph.catalogs)?;
 
     // 5a. Under `strict-peer-dependencies=true`, scan the resolved
-    //     graph for unmet required peers and fail the install with the
+    //     graph for unmet peers and fail the install with the
     //     list. Default (strict=false) is silent, matching bun/npm/yarn
     //     — the previous pnpm-style warn-on-every-mismatch default
     //     produced a lot of noise on real-world trees and buried the
-    //     genuinely actionable ones. Optional peers
-    //     (peerDependenciesMeta.optional) are skipped either way, and
+    //     genuinely actionable ones. Missing optional peers are allowed;
+    //     provided optional peers are checked for version mismatches.
     //     `peerDependencyRules` escape hatches filter out matches
     //     before the strict check fires.
     //
