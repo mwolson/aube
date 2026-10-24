@@ -796,7 +796,9 @@ fn render_subtree(
     for (i, (name, version)) in children.iter().enumerate() {
         let is_last = i == last;
         let connector = if is_last { "└── " } else { "├── " };
-        let dep_path = format!("{name}@{version}");
+        let dep_path =
+            aube_lockfile::resolve_dep_edge(name, version, |key| graph.packages.contains_key(key))
+                .unwrap_or_else(|| format!("{name}@{version}"));
         let (display_name, display_version) = if sanitize_tree {
             (
                 aube_util::terminal::sanitize_inline(name),
@@ -987,7 +989,9 @@ fn build_json_subtree(
         return out;
     }
     for (name, version) in &pkg.dependencies {
-        let dep_path = format!("{name}@{version}");
+        let dep_path =
+            aube_lockfile::resolve_dep_edge(name, version, |key| graph.packages.contains_key(key))
+                .unwrap_or_else(|| format!("{name}@{version}"));
         let mut entry = serde_json::Map::new();
         entry.insert(
             "version".to_string(),
@@ -1079,7 +1083,9 @@ fn collect_transitive(
         return;
     }
     for (name, version) in &pkg.dependencies {
-        let dep_path = format!("{name}@{version}");
+        let dep_path =
+            aube_lockfile::resolve_dep_edge(name, version, |key| graph.packages.contains_key(key))
+                .unwrap_or_else(|| format!("{name}@{version}"));
         if out.contains_key(&dep_path) {
             continue;
         }

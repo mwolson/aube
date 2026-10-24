@@ -26,30 +26,9 @@
 //! gives us alphabetized keys for free. BLAKE3 is the project default
 //! for non-crypto-verifying hashes (3-5x faster than SHA-256).
 
-use crate::{LockedPackage, LockfileGraph, shared_local_dep_path};
+use crate::{LockedPackage, LockfileGraph, resolve_dep_edge};
 use serde::Serialize;
 use std::collections::BTreeMap;
-
-/// Resolve a child dependency's recorded `(alias, tail)` to the graph
-/// key the target package is stored under.
-///
-/// Registry deps record their version verbatim, so `alias@tail` is the
-/// key. Git / remote-tarball deps record their *resolved URL* as the
-/// tail while the package is keyed under the hashed
-/// `alias@git+<hash>` / `alias@url+<hash>` form; [`shared_local_dep_path`]
-/// performs that translation. Falling back to the raw `alias@tail`
-/// keeps the common case allocation-light and behaves identically to
-/// the pre-canonicalization lookup for everything that isn't a
-/// content-pinned source.
-///
-/// Keeping this in lockstep with the linker's sibling-symlink keying
-/// (which calls the same helper) is load-bearing: if the hasher skipped
-/// a URL-shaped git child, the parent's GVS hash would omit that child's
-/// content fingerprint and build/engine taint, and two materially
-/// different trees would collide on one virtual-store path.
-fn child_dep_path(alias: &str, tail: &str) -> String {
-    shared_local_dep_path(alias, tail).unwrap_or_else(|| format!("{alias}@{tail}"))
-}
 
 use aube_util::collections::FxMap as FxHashMap;
 use aube_util::collections::FxSet as FxHashSet;
@@ -284,13 +263,11 @@ fn calc_deps_hash(
             let id = full_pkg_id(pkg, patch_hash, content_hash(dep_path).as_deref());
             let mut deps: BTreeMap<String, String> = BTreeMap::new();
             for (alias, child_tail) in &pkg.dependencies {
-                let child_dep_path = child_dep_path(alias, child_tail);
-                // The child might not be in the graph if the lockfile
-                // has a dangling reference (e.g. after manual edits);
-                // skip rather than panic.
-                if !graph.packages.contains_key(&child_dep_path) {
+                let Some(child_dep_path) =
+                    resolve_dep_edge(alias, child_tail, |key| graph.packages.contains_key(key))
+                else {
                     continue;
-                }
+                };
                 let child_hash = calc_deps_hash(
                     graph,
                     &child_dep_path,
@@ -335,8 +312,9 @@ fn transitively_requires_build(
     }
     let result = match graph.packages.get(dep_path) {
         Some(pkg) => pkg.dependencies.iter().any(|(alias, tail)| {
-            let child_dep_path = child_dep_path(alias, tail);
-            transitively_requires_build(graph, builds, &child_dep_path, cache, parents)
+            resolve_dep_edge(alias, tail, |key| graph.packages.contains_key(key)).is_some_and(
+                |child| transitively_requires_build(graph, builds, &child, cache, parents),
+            )
         }),
         None => false,
     };
@@ -384,8 +362,9 @@ pub fn content_affected_dep_paths(graph: &LockfileGraph) -> FxHashSet<String> {
             stack.push(dep_path.clone());
         }
         for (alias, child_tail) in &pkg.dependencies {
-            let child = child_dep_path(alias, child_tail);
-            if graph.packages.contains_key(&child) {
+            if let Some(child) =
+                resolve_dep_edge(alias, child_tail, |key| graph.packages.contains_key(key))
+            {
                 parents_of.entry(child).or_default().push(dep_path.clone());
             }
         }
@@ -678,6 +657,69 @@ mod tests {
     const URL_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     #[test]
+    fn local_edges_preserve_hash_taint_and_filtered_subtrees() {
+        for path in ["vendor/child", "child.tgz"] {
+            for contextual in [false, true] {
+                let local = LocalSource::Directory(path.into());
+                let key = if contextual {
+                    format!("{}(peer@1.0.0)", local.dep_path("child"))
+                } else {
+                    local.dep_path("child")
+                };
+                let mut g = empty_graph();
+                let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+                parent
+                    .dependencies
+                    .insert("child".into(), format!("file:{path}(peer@1.0.0)"));
+                g.packages.insert(parent.dep_path.clone(), parent);
+                let mut child = mk_pkg("child", "1.0.0", None);
+                child.dep_path = key.clone();
+                child.local_source = Some(local);
+                child.dependencies.insert("leaf".into(), "1.0.0".into());
+                g.packages.insert(key.clone(), child);
+                let mut leaf = mk_pkg("leaf", "1.0.0", None);
+                leaf.local_source = Some(LocalSource::RemoteTarball(crate::RemoteTarballSource {
+                    url: "https://example.com/leaf.tgz".into(),
+                    integrity: "sha512-leaf".into(),
+                    git_hosted: false,
+                }));
+                g.packages.insert(leaf.dep_path.clone(), leaf);
+                g.importers.insert(
+                    ".".into(),
+                    vec![crate::DirectDep {
+                        name: "parent".into(),
+                        dep_path: "parent@1.0.0".into(),
+                        dep_type: crate::DepType::Production,
+                        specifier: Some("1.0.0".into()),
+                    }],
+                );
+                let hash = |content: &str, engine: &str| {
+                    compute_graph_hashes_full(
+                        &g,
+                        &|pkg| pkg.name == "leaf",
+                        Some(&EngineName(engine.into())),
+                        &|_, _| None,
+                        &|dp| (dp == key).then(|| content.to_string()),
+                    )
+                };
+                let first = hash("first", "node20");
+                assert_ne!(
+                    first.node_hash["parent@1.0.0"],
+                    hash("second", "node20").node_hash["parent@1.0.0"]
+                );
+                assert_ne!(
+                    first.node_hash["parent@1.0.0"],
+                    hash("first", "node22").node_hash["parent@1.0.0"]
+                );
+                assert!(content_affected_dep_paths(&g).contains("parent@1.0.0"));
+                let filtered = g.filter_deps(|_| true);
+                assert_eq!(filtered.packages.len(), 3);
+                assert!(filtered.packages.contains_key(&key));
+            }
+        }
+    }
+
+    #[test]
     fn url_shaped_git_child_content_cascades_to_parent() {
         // Real pnpm lockfiles record a git dependency by its *resolved
         // URL* in the parent's `dependencies:` map, while the package is
@@ -688,7 +730,8 @@ mod tests {
         // path. (Distinct from `content_hash_cascades_to_parent`, which
         // feeds the already-canonical synthetic `git+abc` value.)
         let url = format!("https://github.com/request/request.git#{URL_SHA}");
-        let child_key = shared_local_dep_path("request", &url).expect("git url is shareable");
+        let child_key =
+            crate::shared_local_dep_path("request", &url).expect("git url is shareable");
         assert!(
             child_key.starts_with("request@git+"),
             "unexpected: {child_key}"
@@ -721,7 +764,8 @@ mod tests {
         // resolves to a tarball. Keyed under `name@url+<hash>`; the raw
         // `name@<url>` lookup would skip it just like the git case.
         let url = format!("https://codeload.github.com/request/request/tar.gz/{URL_SHA}");
-        let child_key = shared_local_dep_path("request", &url).expect("tarball url is shareable");
+        let child_key =
+            crate::shared_local_dep_path("request", &url).expect("tarball url is shareable");
         assert!(
             child_key.starts_with("request@url+"),
             "unexpected: {child_key}"
@@ -756,7 +800,8 @@ mod tests {
         // ABI. Requires the same canonical child lookup in
         // `transitively_requires_build`.
         let url = format!("https://github.com/request/request.git#{URL_SHA}");
-        let child_key = shared_local_dep_path("request", &url).expect("git url is shareable");
+        let child_key =
+            crate::shared_local_dep_path("request", &url).expect("git url is shareable");
 
         let mut g = empty_graph();
         let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
