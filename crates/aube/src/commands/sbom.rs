@@ -125,7 +125,7 @@ fn render_cyclonedx(
     manifest: &aube_manifest::PackageJson,
     closure: &BTreeMap<String, &LockedPackage>,
     installed_metadata: &BTreeMap<String, super::licenses::InstalledPackageMetadata>,
-    dev_only: &BTreeMap<String, bool>,
+    dev_only: &BTreeMap<&str, bool>,
     exclude_peers: bool,
 ) -> miette::Result<String> {
     let root_name = manifest.name.clone().unwrap_or_else(|| "(unnamed)".into());
@@ -154,7 +154,7 @@ fn render_cyclonedx(
         if let Some(bugs_url) = bugs_url_from_extra(&pkg.extra_meta) {
             c.insert("externalReferences".into(), external_references(bugs_url));
         }
-        if dev_only.get(dep_path).copied().unwrap_or(false) {
+        if dev_only.get(dep_path.as_str()).copied().unwrap_or(false) {
             c.insert("scope".into(), "excluded".into());
             c.insert(
                 "properties".into(),
@@ -291,9 +291,11 @@ fn exclude_peer_only_packages<'a>(
             if peer_names.contains_key(name) {
                 continue;
             }
-            let child_path = format!("{name}@{version}");
-            if closure.contains_key(&child_path) {
-                stack.push(child_path);
+            let Some((child_path, _)) = graph.get_dep_package(name, version) else {
+                continue;
+            };
+            if closure.contains_key(child_path) {
+                stack.push(child_path.clone());
             }
         }
     }
@@ -302,29 +304,37 @@ fn exclude_peer_only_packages<'a>(
 }
 
 fn collect_dev_only_packages<'a>(
-    graph: &LockfileGraph,
+    graph: &'a LockfileGraph,
     roots: impl IntoIterator<Item = &'a DirectDep>,
-) -> BTreeMap<String, bool> {
+) -> BTreeMap<&'a str, bool> {
     let mut out = BTreeMap::new();
-    let mut stack: Vec<(String, bool)> = roots
+    let mut stack: Vec<_> = roots
         .into_iter()
-        .map(|d| (d.dep_path.clone(), matches!(d.dep_type, DepType::Dev)))
+        .map(|d| {
+            (
+                d.dep_path.as_str(),
+                matches!(d.dep_type, DepType::Dev),
+                graph.get_package(&d.dep_path),
+            )
+        })
         .collect();
 
-    while let Some((dep_path, dev_only)) = stack.pop() {
-        match out.get(&dep_path).copied() {
+    while let Some((dep_path, dev_only, pkg)) = stack.pop() {
+        match out.get(dep_path).copied() {
             Some(false) => continue,
             Some(true) if dev_only => continue,
             _ => {
-                out.insert(dep_path.clone(), dev_only);
+                out.insert(dep_path, dev_only);
             }
         }
 
-        let Some(pkg) = graph.get_package(&dep_path) else {
+        let Some(pkg) = pkg else {
             continue;
         };
         for (name, version) in &pkg.dependencies {
-            stack.push((format!("{name}@{version}"), dev_only));
+            if let Some((child_path, child)) = graph.get_dep_package(name, version) {
+                stack.push((child_path.as_str(), dev_only, Some(child)));
+            }
         }
     }
 
@@ -427,8 +437,10 @@ fn render_spdx(
     for (dep_path, child_id) in &id_map {
         let child_pkg = closure[dep_path];
         for (name, version) in &child_pkg.dependencies {
-            let child_dep_path = format!("{name}@{version}");
-            if let Some(grandchild_id) = id_map.get(&child_dep_path) {
+            let Some((child_dep_path, _)) = graph.get_dep_package(name, version) else {
+                continue;
+            };
+            if let Some(grandchild_id) = id_map.get(child_dep_path) {
                 relationships.push(serde_json::json!({
                     "spdxElementId": child_id,
                     "relatedSpdxElement": grandchild_id,

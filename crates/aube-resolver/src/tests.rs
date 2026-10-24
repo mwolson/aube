@@ -4261,6 +4261,7 @@ async fn resolve_handles_lockfile_reused_name_with_incompatible_transitive_range
         },
     );
     let existing = LockfileGraph {
+        pnpm_override_order: Vec::new(),
         packages: existing_pkgs,
         importers: BTreeMap::new(),
         settings: Default::default(),
@@ -4337,6 +4338,7 @@ async fn lockfile_reuse_preserves_transitive_optional_edges() {
         },
     );
     let existing = LockfileGraph {
+        pnpm_override_order: Vec::new(),
         packages: existing_pkgs,
         importers: BTreeMap::new(),
         settings: Default::default(),
@@ -4426,6 +4428,7 @@ async fn lockfile_reuse_keeps_required_peer_missing_from_locked_edges() {
         );
     }
     let existing = LockfileGraph {
+        pnpm_override_order: Vec::new(),
         packages: existing_pkgs,
         importers: BTreeMap::new(),
         settings: Default::default(),
@@ -4694,6 +4697,7 @@ async fn lockfile_reuse_handles_name_at_version_dep_form() {
         },
     );
     let existing = LockfileGraph {
+        pnpm_override_order: Vec::new(),
         packages: existing_pkgs,
         ..Default::default()
     };
