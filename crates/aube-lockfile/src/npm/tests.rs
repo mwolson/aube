@@ -1044,11 +1044,8 @@ fn test_parse_npm_preserves_platform_optional_metadata() {
     );
 }
 
-/// npm sometimes emits `os` / `cpu` / `libc` as scalar strings instead
-/// of arrays (e.g. `sass-embedded-linux-arm@1.99.0` ships
-/// `"libc": "glibc"`). Verbatim-roundtripped into package-lock.json,
-/// the field stays scalar — accept both shapes the same way the
-/// pnpm + bun parsers already do.
+/// Accept scalar platform constraints as well as arrays. npm output
+/// retains os/cpu but omits libc, as npm 10 and 11 do.
 #[test]
 fn parse_npm_package_platform_fields_accept_scalar_strings() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -1160,7 +1157,8 @@ fn test_write_npm_preserves_platform_optional_metadata() {
     let native = &json["packages"]["node_modules/native-win"];
     assert_eq!(native["os"], serde_json::json!(["win32"]));
     assert_eq!(native["cpu"], serde_json::json!(["x64"]));
-    assert_eq!(native["libc"], serde_json::json!(["glibc"]));
+    assert!(native.get("libc").is_none());
+    assert_eq!(graph.packages["native-win@1.0.0"].libc[0], "glibc");
 
     let reparsed = parse(out.path()).unwrap();
     let host = &reparsed.packages["host@1.0.0"];
@@ -1183,10 +1181,7 @@ fn test_write_npm_preserves_platform_optional_metadata() {
         native.cpu.iter().map(String::as_str).collect::<Vec<_>>(),
         vec!["x64"]
     );
-    assert_eq!(
-        native.libc.iter().map(String::as_str).collect::<Vec<_>>(),
-        vec!["glibc"]
-    );
+    assert!(native.libc.is_empty());
 }
 
 /// Regression: `canonical_key_from_dep_path` must strip the
@@ -4009,5 +4004,23 @@ proptest::proptest! {
         for importer in ["", "packages/a"] {
             proptest::prop_assert!(written["packages"][importer].get("engines").is_none());
         }
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn npm_deprecation_roundtrips(message in proptest::option::of("[^\\p{C}]{1,80}")) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package-lock.json");
+        let source = serde_json::json!({"lockfileVersion":3,"packages":{
+            "": {"name":"root","dependencies":{"foo":"1.0.0"}},
+            "node_modules/foo":{"version":"1.0.0","deprecated":message.as_ref().map_or(serde_json::Value::Bool(false), |msg| serde_json::Value::String(msg.clone()))}
+        }});
+        std::fs::write(&path, serde_json::to_vec(&source).unwrap()).unwrap();
+        let graph = parse(&path).unwrap();
+        let manifest: aube_manifest::PackageJson = serde_json::from_value(source["packages"][""].clone()).unwrap();
+        write(&path, &graph, &manifest).unwrap();
+        let written: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        proptest::prop_assert_eq!(written["packages"]["node_modules/foo"].get("deprecated").and_then(serde_json::Value::as_str), message.as_deref());
     }
 }

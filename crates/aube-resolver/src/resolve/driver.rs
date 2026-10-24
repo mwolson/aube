@@ -225,7 +225,11 @@ impl<'a> ResolveDriver<'a> {
 
         let direct_deps_pending = queue.len();
         let cutoff_pending = resolver.resolution_mode == ResolutionMode::TimeBased;
-        let fetcher = FetchScheduler::new(resolver, shared_semaphore, needs_time);
+        let fetcher = FetchScheduler::new(
+            resolver,
+            shared_semaphore,
+            needs_time || resolver.full_metadata,
+        );
 
         let existing_names: FxHashSet<&'a str> = existing
             .map(|g| g.packages.values().map(|p| p.name.as_str()).collect())
@@ -788,7 +792,7 @@ impl<'a> ResolveDriver<'a> {
                         .map_err(|e| Error::Registry(registry_name.clone(), e.to_string()))?;
                     }
                     let fetch_start = std::time::Instant::now();
-                    let live = if self.needs_time {
+                    let live = if self.needs_time || self.resolver.full_metadata {
                         match self.resolver.packument_full_cache_dir.as_ref() {
                             Some(dir) => {
                                 self.resolver
@@ -1256,31 +1260,10 @@ impl<'a> ResolveDriver<'a> {
                 alias_of: task.real_name.clone(),
                 yarn_checksum: None,
                 engines: version_meta.engines.clone(),
-                // Rehydrate a string-form bin (`"bin": "cli.js"`)
-                // into `{<package_name>: "cli.js"}` — registry
-                // packuments leave the name off, expecting
-                // consumers to default it to the package name.
-                // Doing it here keeps bun's per-entry meta
-                // byte-identical to bun's own output without
-                // pushing the fixup into every writer.
-                bin: {
-                    let mut m = version_meta.bin.clone();
-                    if let Some(path) = m.remove("") {
-                        // String-form `bin` in a packument
-                        // (`"bin": "cli.js"`) is implicitly
-                        // named after the real registry
-                        // package — not the alias. For an
-                        // aliased dep (`"h3-v2": "npm:h3@…"`)
-                        // the bun writer must emit the bin
-                        // under `h3`, not `h3-v2`, or the
-                        // map drifts against bun's own
-                        // output (and the shim install path
-                        // creates the wrong binary name).
-                        let bin_name = task.real_name.as_deref().unwrap_or(&task.name).to_string();
-                        m.insert(bin_name, path);
-                    }
-                    m
-                },
+                bin: aube_registry::normalize_bin(
+                    task.real_name.as_deref().unwrap_or(&task.name),
+                    &version_meta.bin,
+                ),
                 // Declared ranges straight from the packument's
                 // `dependencies` / `optionalDependencies`. Fed
                 // back out by npm / yarn / bun writers so
@@ -1327,6 +1310,15 @@ impl<'a> ResolveDriver<'a> {
                         meta.insert(
                             aube_lockfile::EXTRA_PNPM_BUNDLED_DEPENDENCIES.to_string(),
                             value,
+                        );
+                    }
+                    if let Some(funding) = &version_meta.funding {
+                        meta.insert(
+                            aube_lockfile::EXTRA_NPM_FUNDING.to_string(),
+                            match funding {
+                                serde_json::Value::String(url) => serde_json::json!({"url": url}),
+                                value => value.clone(),
+                            },
                         );
                     }
                     meta
