@@ -1746,6 +1746,11 @@ impl<'a> ResolveDriver<'a> {
                 };
                 (local, version, deps, optional_deps, local_integrity)
             };
+        let mut declared_dependencies: BTreeMap<String, String> = target_deps
+            .iter()
+            .chain(target_optional_deps.iter())
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect();
         for name in &local_bundles {
             target_deps.remove(name);
             target_optional_deps.remove(name);
@@ -1765,6 +1770,8 @@ impl<'a> ResolveDriver<'a> {
             &self.resolver.dependency_policy.package_extensions,
         );
         target_optional_deps.retain(|name, _| !target_deps.contains_key(name));
+        declared_dependencies.extend(target_deps.clone());
+        declared_dependencies.extend(target_optional_deps.clone());
         let dep_path = local.dep_path(&task.name);
         let linked_name = task.name.clone();
 
@@ -1825,9 +1832,11 @@ impl<'a> ResolveDriver<'a> {
                     peer_dependencies: local_peers,
                     peer_dependencies_meta: local_peers_meta,
                     bundled_dependencies: local_bundles,
+                    declared_dependencies,
                     extra_meta: local_meta,
                     ..Default::default()
-                },
+                }
+                .with_declared_dependencies_known(),
             );
             if let Some(ref tx) = self.resolver.resolved_tx {
                 let pending = self.queue.len()
