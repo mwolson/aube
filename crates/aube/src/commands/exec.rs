@@ -390,7 +390,7 @@ fn bin_not_found_error(bin: &str) -> miette::Report {
     )
 }
 
-fn project_bin_dirs(cwd: &Path) -> Vec<PathBuf> {
+pub(super) fn project_bin_dirs(cwd: &Path) -> Vec<PathBuf> {
     let local = super::project_modules_dir(cwd).join(".bin");
     let mut dirs = vec![local.clone()];
     if let Some(root) = crate::dirs::find_workspace_root(cwd) {

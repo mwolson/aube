@@ -1161,10 +1161,10 @@ async fn build_script_command(
     let node_gyp_bin_dir = super::install::node_gyp_bootstrap::lazy_shim_bin_dir(&bin_dir)?;
     let activated_shim_dir = crate::tool_shims::activated_shim_dir();
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut project_bins = Vec::with_capacity(1 + usize::from(node_gyp_bin_dir.is_some()));
-    project_bins.push(bin_dir);
+    let mut project_bins = super::exec::project_bin_dirs(cwd);
     if let Some(dir) = node_gyp_bin_dir {
-        project_bins.push(dir);
+        // pnpm orders script bins as member, node-gyp, then workspace root.
+        project_bins.insert(1, dir);
     }
     let mut entries = crate::runtime::path_entries_with_project_bins(project_bins);
     entries
