@@ -92,6 +92,8 @@ pub(super) struct RawNpmPackage {
     pub(super) funding: Option<RawNpmFunding>,
     #[serde(default)]
     pub(super) has_install_script: bool,
+    #[serde(default)]
+    pub(super) deprecated: Option<serde_json::Value>,
 }
 
 pub(super) const BUNDLED_OPTIONAL_KEY: &str = "__aube_npm_bundled_optional";
