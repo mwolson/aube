@@ -182,7 +182,10 @@ impl<'a> Parser<'a> {
                     settings = Some(self.parse_via_serde::<RawSettings>(2)?);
                 }
                 b"overrides" => {
-                    overrides = Some(self.parse_string_map(inline, 2)?);
+                    let saved = self.pos;
+                    self.parse_string_map(inline, 2)?;
+                    self.pos = saved;
+                    overrides = Some(self.parse_via_serde::<super::raw::OrderedOverrides>(2)?);
                 }
                 b"catalogs" => {
                     if inline.is_some() {
@@ -1206,7 +1209,7 @@ mod subset_tests {
         let lock = "lockfileVersion: '9.0'\noverrides:\n  pkg: 'git+ssh://git@github.com/foo/bar.git#v1'\n  url: 'https://example.com/path:8080/x'\n";
         assert_fires_and_matches("colon-values", lock);
         let raw = try_parse(lock).unwrap();
-        let ov = raw.overrides.unwrap();
+        let ov = raw.overrides.unwrap().values;
         assert_eq!(ov["pkg"], "git+ssh://git@github.com/foo/bar.git#v1");
         assert_eq!(ov["url"], "https://example.com/path:8080/x");
     }

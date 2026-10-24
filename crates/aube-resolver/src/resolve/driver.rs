@@ -1304,16 +1304,26 @@ impl<'a> ResolveDriver<'a> {
                 // `deprecated_msg`: that one is gated by
                 // `allowedDeprecatedVersions`, which only silences the
                 // install warning — pnpm still records the field.
-                extra_meta: version_meta
-                    .deprecated
-                    .as_deref()
-                    .map(|msg| {
-                        BTreeMap::from([(
+                extra_meta: {
+                    let mut meta = BTreeMap::new();
+                    if let Some(message) = &version_meta.deprecated {
+                        meta.insert(
                             "deprecated".to_string(),
-                            serde_json::Value::String(msg.to_string()),
-                        )])
-                    })
-                    .unwrap_or_default(),
+                            serde_json::Value::String(message.clone()),
+                        );
+                    }
+                    if let Some(bundled) = &version_meta.bundled_dependencies
+                        && let Ok(value) = serde_json::to_value(bundled)
+                        && (value == serde_json::Value::Bool(true)
+                            || value.as_array().is_some_and(|names| !names.is_empty()))
+                    {
+                        meta.insert(
+                            aube_lockfile::EXTRA_PNPM_BUNDLED_DEPENDENCIES.to_string(),
+                            value,
+                        );
+                    }
+                    meta
+                },
             }
             .with_declared_dependencies_known(),
         );
@@ -1632,6 +1642,9 @@ impl<'a> ResolveDriver<'a> {
                 ),
             ));
         }
+        let mut local_integrity = None;
+        let mut local_bundles = Vec::new();
+        let mut local_meta = BTreeMap::new();
         let mut local_peers = BTreeMap::new();
         let mut local_peers_meta = BTreeMap::new();
         let (mut local, real_version, mut target_deps, mut target_optional_deps, integrity) =
@@ -1677,41 +1690,70 @@ impl<'a> ResolveDriver<'a> {
                 // every downstream consumer can resolve it with a single
                 // `project_root.join(rel)`.
                 let local = rebase_local(&raw_local, &importer_root, &self.resolver.project_root);
-                let (version, deps, optional_deps) =
-                    if matches!(local, LocalSource::Exec(_)) {
-                        if self.resolver.ignore_scripts {
-                            return Err(Error::Registry(
-                                task.name.clone(),
-                                format!(
-                                    "{} requires executing its generator, but scripts are disabled",
-                                    local.specifier()
-                                ),
-                            ));
-                        }
-                        let (version, deps) =
-                            resolve_exec_manifest(&task.name, &local, &self.resolver.project_root)
-                                .await?;
-                        (version, deps, BTreeMap::new())
-                    } else {
-                        let manifest = read_local_manifest(&raw_local, &importer_root)
-                            .unwrap_or_else(|_| crate::local_source::LocalManifest {
+                let (version, deps, optional_deps) = if matches!(local, LocalSource::Exec(_)) {
+                    if self.resolver.ignore_scripts {
+                        return Err(Error::Registry(
+                            task.name.clone(),
+                            format!(
+                                "{} requires executing its generator, but scripts are disabled",
+                                local.specifier()
+                            ),
+                        ));
+                    }
+                    let (version, deps) =
+                        resolve_exec_manifest(&task.name, &local, &self.resolver.project_root)
+                            .await?;
+                    (version, deps, BTreeMap::new())
+                } else {
+                    let manifest =
+                        read_local_manifest(&raw_local, &importer_root).unwrap_or_else(|_| {
+                            crate::local_source::LocalManifest {
                                 name: task.name.clone(),
+                                integrity: None,
+                                bundled_dependencies: None,
                                 version: "0.0.0".to_string(),
                                 dependencies: BTreeMap::new(),
                                 optional_dependencies: BTreeMap::new(),
                                 peer_dependencies: BTreeMap::new(),
                                 peer_dependencies_meta: BTreeMap::new(),
-                            });
-                        local_peers = manifest.peer_dependencies;
-                        local_peers_meta = manifest.peer_dependencies_meta;
-                        (
-                            manifest.version,
-                            manifest.dependencies,
-                            manifest.optional_dependencies,
-                        )
-                    };
-                (local, version, deps, optional_deps, None)
+                            }
+                        });
+                    if let Some(bundled) = &manifest.bundled_dependencies {
+                        // Directory imports omit node_modules, so only tarballs
+                        // can supply bundled children without resolving them.
+                        if matches!(local, LocalSource::Tarball(_)) {
+                            local_bundles = bundled
+                                .names(&manifest.dependencies)
+                                .into_iter()
+                                .map(str::to_string)
+                                .collect();
+                        }
+                        if matches!(bundled, aube_manifest::BundledDependencies::All(true))
+                            || matches!(bundled, aube_manifest::BundledDependencies::List(names) if !names.is_empty())
+                        {
+                            local_meta.insert(
+                                aube_lockfile::EXTRA_PNPM_BUNDLED_DEPENDENCIES.to_string(),
+                                serde_json::to_value(bundled).map_err(|e| {
+                                    Error::Registry(task.name.clone(), e.to_string())
+                                })?,
+                            );
+                        }
+                    }
+                    local_integrity = manifest.integrity;
+                    local_peers = manifest.peer_dependencies;
+                    local_peers_meta = manifest.peer_dependencies_meta;
+                    (
+                        manifest.version,
+                        manifest.dependencies,
+                        manifest.optional_dependencies,
+                    )
+                };
+                (local, version, deps, optional_deps, local_integrity)
             };
+        for name in &local_bundles {
+            target_deps.remove(name);
+            target_optional_deps.remove(name);
+        }
         attach_integrity_to_git_source(&mut local, integrity.as_deref());
         // Apply `packageExtensions` to non-registry packages too. The
         // registry path applies them to the picked VersionMetadata; git /
@@ -1786,6 +1828,8 @@ impl<'a> ResolveDriver<'a> {
                     local_source: Some(local.clone()),
                     peer_dependencies: local_peers,
                     peer_dependencies_meta: local_peers_meta,
+                    bundled_dependencies: local_bundles,
+                    extra_meta: local_meta,
                     ..Default::default()
                 },
             );

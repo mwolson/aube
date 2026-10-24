@@ -291,7 +291,11 @@ fn exclude_peer_only_packages<'a>(
             if peer_names.contains_key(name) {
                 continue;
             }
-            let child_path = format!("{name}@{version}");
+            let Some(child_path) = aube_lockfile::resolve_dep_edge(name, version, |key| {
+                graph.packages.contains_key(key)
+            }) else {
+                continue;
+            };
             if closure.contains_key(&child_path) {
                 stack.push(child_path);
             }
@@ -324,7 +328,11 @@ fn collect_dev_only_packages<'a>(
             continue;
         };
         for (name, version) in &pkg.dependencies {
-            stack.push((format!("{name}@{version}"), dev_only));
+            if let Some(child) = aube_lockfile::resolve_dep_edge(name, version, |key| {
+                graph.packages.contains_key(key)
+            }) {
+                stack.push((child, dev_only));
+            }
         }
     }
 
@@ -427,7 +435,11 @@ fn render_spdx(
     for (dep_path, child_id) in &id_map {
         let child_pkg = closure[dep_path];
         for (name, version) in &child_pkg.dependencies {
-            let child_dep_path = format!("{name}@{version}");
+            let Some(child_dep_path) = aube_lockfile::resolve_dep_edge(name, version, |key| {
+                graph.packages.contains_key(key)
+            }) else {
+                continue;
+            };
             if let Some(grandchild_id) = id_map.get(&child_dep_path) {
                 relationships.push(serde_json::json!({
                     "spdxElementId": child_id,

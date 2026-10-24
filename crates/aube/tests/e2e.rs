@@ -485,3 +485,302 @@ fn completion_bin_selects_one_program_and_rejects_install() {
             .exists()
     );
 }
+
+#[test]
+fn directory_bundle_declarations_resolve_children_without_source_install() {
+    check_directory_bundle(false);
+}
+
+#[test]
+fn directory_bundle_declarations_resolve_children_with_source_install() {
+    check_directory_bundle(true);
+}
+
+fn check_directory_bundle(preinstalled: bool) {
+    let _guard = e2e_lock();
+    for gvs in [false, true] {
+        for bundles in [serde_json::json!(["bundle-child"]), serde_json::json!(true)] {
+            let sbx = Sandbox::new();
+            let host = sbx.project.join("vendor/host");
+            let child = sbx.project.join("vendor/child");
+            fs::create_dir_all(&host).unwrap();
+            fs::create_dir_all(&child).unwrap();
+            fs::write(
+                child.join("package.json"),
+                r#"{"name":"bundle-child","version":"1.0.0","main":"index.js"}"#,
+            )
+            .unwrap();
+            fs::write(child.join("index.js"), "module.exports = 'resolved child';").unwrap();
+            fs::write(
+                host.join("package.json"),
+                serde_json::json!({
+                    "name": "bundle-host", "version": "1.0.0", "main": "index.js",
+                    "dependencies": {"bundle-child": format!("file:{}", child.display())},
+                    "bundledDependencies": bundles
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                host.join("index.js"),
+                "module.exports = require('bundle-child');",
+            )
+            .unwrap();
+            if preinstalled {
+                let installed = host.join("node_modules/bundle-child");
+                fs::create_dir_all(&installed).unwrap();
+                fs::copy(child.join("package.json"), installed.join("package.json")).unwrap();
+                fs::write(
+                    installed.join("index.js"),
+                    "module.exports = 'source child';",
+                )
+                .unwrap();
+            }
+            sbx.write_manifest(
+                r#"{"name":"directory-bundle","private":true,"dependencies":{"bundle-host":"file:vendor/host"}}"#,
+            );
+            fs::write(
+                sbx.project.join("pnpm-lock.yaml"),
+                "lockfileVersion: '9.0'\n",
+            )
+            .unwrap();
+            for frozen in [false, true] {
+                let mut cmd = sbx.cmd();
+                cmd.args(["install", "--ignore-scripts"]).arg(if gvs {
+                    "--enable-global-virtual-store"
+                } else {
+                    "--disable-global-virtual-store"
+                });
+                if frozen {
+                    cmd.arg("--frozen-lockfile");
+                }
+                cmd.assert().success();
+                let output = std::process::Command::new("node")
+                    .current_dir(&sbx.project)
+                    .args(["-e", "console.log(require('bundle-host'))"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "gvs={gvs}, frozen={frozen}, bundles={bundles}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout).trim(),
+                    "resolved child"
+                );
+                if !frozen {
+                    fs::remove_dir_all(sbx.project.join("node_modules")).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn transitive_local_directory_survives_clean_frozen_pnpm_install() {
+    check_transitive_local_package(false, "pnpm", ".");
+}
+
+#[test]
+fn transitive_local_tarball_survives_clean_frozen_pnpm_install() {
+    check_transitive_local_package(true, "pnpm", ".");
+}
+
+#[test]
+fn transitive_local_packages_survive_clean_frozen_relocated_lockfiles() {
+    for format in ["aube", "pnpm"] {
+        for lockfile_dir in ["locks", "../sibling-locks"] {
+            for tarball in [false, true] {
+                check_transitive_local_package(tarball, format, lockfile_dir);
+            }
+        }
+    }
+}
+
+fn check_transitive_local_package(tarball: bool, format: &str, lockfile_dir: &str) {
+    let _guard = e2e_lock();
+    for (linker, gvs) in [
+        ("hoisted", false),
+        ("hoisted", true),
+        ("isolated", false),
+        ("isolated", true),
+    ] {
+        let sbx = Sandbox::new();
+        let host = sbx.project.join("vendor/host");
+        let child = sbx.project.join("vendor/child");
+        let leaf = sbx.project.join("vendor/leaf");
+        for dir in [&host, &child, &leaf] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::write(
+            leaf.join("package.json"),
+            r#"{"name":"leaf","version":"1.0.0","main":"index.js"}"#,
+        )
+        .unwrap();
+        fs::write(
+            leaf.join("index.js"),
+            "module.exports = 'transitive child ok';",
+        )
+        .unwrap();
+        fs::write(
+            child.join("package.json"),
+            serde_json::json!({
+                "name": "child", "version": "1.0.0", "main": "index.js",
+                "dependencies": if tarball { serde_json::json!({}) } else { serde_json::json!({"leaf": format!("file:{}", leaf.display())}) }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            child.join("index.js"),
+            if tarball {
+                "module.exports = 'transitive child ok';"
+            } else {
+                "module.exports = require('leaf');"
+            },
+        )
+        .unwrap();
+        let child_path = if tarball {
+            let path = sbx.project.join("child.tgz");
+            let archive = fs::File::create(&path).unwrap();
+            let gzip = flate2::write::GzEncoder::new(archive, flate2::Compression::default());
+            let mut tar = tar::Builder::new(gzip);
+            tar.append_dir_all("package", &child).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+            path
+        } else {
+            child
+        };
+        fs::write(
+            host.join("package.json"),
+            serde_json::json!({
+                "name": "host", "version": "1.0.0", "main": "index.js",
+                "dependencies": {"child": format!("file:{}", child_path.display())}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(host.join("index.js"), "module.exports = require('child');").unwrap();
+        sbx.write_manifest(r#"{"private":true,"dependencies":{"host":"file:vendor/host"}}"#);
+        fs::write(
+            sbx.project.join(".npmrc"),
+            format!("node-linker={linker}\ndefault-lockfile-format={format}\n"),
+        )
+        .unwrap();
+        let lockfile = sbx
+            .project
+            .join(lockfile_dir)
+            .join(format!("{format}-lock.yaml"));
+        let mut fresh_lock = Vec::new();
+        for frozen in [false, true] {
+            let mut cmd = sbx.cmd();
+            cmd.args(["install", "--ignore-scripts"])
+                .arg(format!("--lockfile-dir={lockfile_dir}"))
+                .arg(if frozen {
+                    "--frozen-lockfile"
+                } else {
+                    "--no-frozen-lockfile"
+                })
+                .arg(if gvs {
+                    "--enable-global-virtual-store"
+                } else {
+                    "--disable-global-virtual-store"
+                });
+            cmd.assert().success();
+            let output = std::process::Command::new("node")
+                .current_dir(&sbx.project)
+                .args(["-e", "console.log(require('host'))"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "format={format}, lockfile_dir={lockfile_dir}, tarball={tarball}, linker={linker}, gvs={gvs}, frozen={frozen}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                "transitive child ok"
+            );
+            let lock = fs::read(&lockfile).unwrap();
+            if frozen {
+                assert_eq!(lock, fresh_lock, "frozen install rewrote the lockfile");
+            } else {
+                fresh_lock = lock;
+                fs::remove_dir_all(sbx.project.join("node_modules")).unwrap();
+                for source in [&host, &sbx.project.join("vendor/child"), &leaf] {
+                    let modules = source.join("node_modules");
+                    if modules.exists() {
+                        fs::remove_dir_all(modules).unwrap();
+                    }
+                }
+                fs::remove_dir_all(&sbx.store).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn boolean_bundle_bins_survive_clean_frozen_pnpm_install() {
+    let _guard = e2e_lock();
+    let sbx = Sandbox::new();
+    let host = sbx._root.path().join("package");
+    let child = host.join("node_modules/bundle-child");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(
+        host.join("package.json"),
+        r#"{"name":"bundle-host","version":"1.0.0","dependencies":{"bundle-child":"1.0.0"},"bundledDependencies":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        child.join("package.json"),
+        r#"{"name":"bundle-child","version":"1.0.0","bin":{"bundle-cli":"cli.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        child.join("cli.js"),
+        "#!/usr/bin/env node\nconsole.log('bundled command');\n",
+    )
+    .unwrap();
+    let archive = fs::File::create(sbx.project.join("host.tgz")).unwrap();
+    let gzip = flate2::write::GzEncoder::new(archive, flate2::Compression::default());
+    let mut tar = tar::Builder::new(gzip);
+    tar.append_dir_all("package", &host).unwrap();
+    tar.into_inner().unwrap().finish().unwrap();
+    sbx.write_manifest(
+        r#"{"name":"boolean-bundle","private":true,"dependencies":{"bundle-host":"file:host.tgz"}}"#,
+    );
+    fs::write(
+        sbx.project.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n",
+    )
+    .unwrap();
+    for frozen in [false, true] {
+        let mut cmd = sbx.cmd();
+        cmd.args(["install", "--ignore-scripts"]);
+        if frozen {
+            cmd.arg("--frozen-lockfile");
+        }
+        cmd.assert().success();
+        let lock = fs::read_to_string(sbx.project.join("pnpm-lock.yaml")).unwrap();
+        assert!(lock.contains("bundledDependencies: true"), "{lock}");
+        assert!(
+            !lock
+                .split("snapshots:")
+                .nth(1)
+                .unwrap()
+                .contains("bundledDependencies")
+        );
+        let bin = sbx.project.join("node_modules/.bin/bundle-cli");
+        assert!(bin.exists(), "bundled bin missing, frozen={frozen}");
+        sbx.cmd()
+            .args(["exec", "bundle-cli"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("bundled command"));
+        if !frozen {
+            fs::remove_dir_all(sbx.project.join("node_modules")).unwrap();
+            fs::remove_dir_all(&sbx.store).unwrap();
+        }
+    }
+}
