@@ -559,7 +559,11 @@ pub(crate) fn link_dep_bins(input: LinkDepBinsInput<'_>) -> miette::Result<()> {
             // Mirror the linker's self-ref guard from
             // `materialize_into`: a package that depends on its own
             // dep_path is a graph artefact, not a real edge.
-            let child_dep_path = format!("{child_name}@{child_version}");
+            let child_dep_path =
+                aube_lockfile::resolve_dep_edge(child_name, child_version, |key| {
+                    graph.packages.contains_key(key)
+                })
+                .unwrap_or_else(|| format!("{child_name}@{child_version}"));
             if child_dep_path == *dep_path && child_name == &pkg.name {
                 continue;
             }
@@ -1496,7 +1500,21 @@ fn link_bundled_bins(
     let Some(locked) = graph.get_package(dep_path) else {
         return Ok(());
     };
-    for bundled in &locked.bundled_dependencies {
+    // pnpm preserves boolean declarations without their names in snapshots.
+    // The shipped manifest still has the production dependency names.
+    let manifest_names;
+    let bundled_names = if locked
+        .extra_meta
+        .get(aube_lockfile::EXTRA_PNPM_BUNDLED_DEPENDENCIES)
+        == Some(&serde_json::Value::Bool(true))
+    {
+        let manifest = aube_manifest::PackageJson::from_path_cached(&pkg_dir.join("package.json"))?;
+        manifest_names = manifest.dependencies.keys().cloned().collect::<Vec<_>>();
+        &manifest_names
+    } else {
+        &locked.bundled_dependencies
+    };
+    for bundled in bundled_names {
         let bundled_dir = pkg_dir.join("node_modules").join(bundled);
         let bundled_pkg_json_path = bundled_dir.join("package.json");
         let Ok(content) = std::fs::read_to_string(&bundled_pkg_json_path) else {

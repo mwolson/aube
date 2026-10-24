@@ -796,7 +796,11 @@ fn render_subtree(
     for (i, (name, version)) in children.iter().enumerate() {
         let is_last = i == last;
         let connector = if is_last { "└── " } else { "├── " };
-        let dep_path = format!("{name}@{version}");
+        let child = graph.get_dep_package(name, version);
+        let dep_path = child.map_or_else(
+            || std::borrow::Cow::Owned(format!("{name}@{version}")),
+            |(key, _)| std::borrow::Cow::Borrowed(key.as_str()),
+        );
         let (display_name, display_version) = if sanitize_tree {
             (
                 aube_util::terminal::sanitize_inline(name),
@@ -822,7 +826,7 @@ fn render_subtree(
         };
         // Cycle guard: if we've already printed this dep_path in the current
         // walk, mark it as deduped instead of recursing forever.
-        let cycle_marker = if visited.contains(&dep_path) {
+        let cycle_marker = if visited.contains(dep_path.as_ref()) {
             " (cycle)"
         } else {
             ""
@@ -830,8 +834,8 @@ fn render_subtree(
         println!("{prefix}{connector}{display_name} {display_version}{extra}{cycle_marker}");
 
         if cycle_marker.is_empty() {
-            visited.insert(dep_path.clone());
-            if let Some(child) = graph.get_package(&dep_path) {
+            visited.insert(dep_path.to_string());
+            if let Some((_, child)) = child {
                 let nested_prefix = format!("{prefix}{}", if is_last { "    " } else { "│   " });
                 render_subtree(
                     graph,
@@ -845,7 +849,7 @@ fn render_subtree(
                     sanitize_tree,
                 );
             }
-            visited.remove(&dep_path);
+            visited.remove(dep_path.as_ref());
         }
     }
 }
@@ -987,18 +991,22 @@ fn build_json_subtree(
         return out;
     }
     for (name, version) in &pkg.dependencies {
-        let dep_path = format!("{name}@{version}");
+        let child = graph.get_dep_package(name, version);
+        let dep_path = child.map_or_else(
+            || std::borrow::Cow::Owned(format!("{name}@{version}")),
+            |(key, _)| std::borrow::Cow::Borrowed(key.as_str()),
+        );
         let mut entry = serde_json::Map::new();
         entry.insert(
             "version".to_string(),
             serde_json::Value::String(version.clone()),
         );
 
-        if visited.contains(&dep_path) {
+        if visited.contains(dep_path.as_ref()) {
             entry.insert("cycle".to_string(), serde_json::Value::Bool(true));
         } else {
-            visited.insert(dep_path.clone());
-            if let Some(child) = graph.get_package(&dep_path) {
+            visited.insert(dep_path.to_string());
+            if let Some((_, child)) = child {
                 let children = build_json_subtree(graph, child, args, current_depth + 1, visited);
                 if !children.is_empty() {
                     entry.insert(
@@ -1007,7 +1015,7 @@ fn build_json_subtree(
                     );
                 }
             }
-            visited.remove(&dep_path);
+            visited.remove(dep_path.as_ref());
         }
 
         out.insert(name.clone(), serde_json::Value::Object(entry));
@@ -1079,17 +1087,17 @@ fn collect_transitive(
         return;
     }
     for (name, version) in &pkg.dependencies {
-        let dep_path = format!("{name}@{version}");
-        if out.contains_key(&dep_path) {
+        let Some((dep_path, child)) = graph.get_dep_package(name, version) else {
+            continue;
+        };
+        if out.contains_key(dep_path) {
             continue;
         }
-        if let Some(child) = graph.get_package(&dep_path) {
-            out.insert(
-                dep_path.clone(),
-                (child.name.clone(), child.version.clone()),
-            );
-            collect_transitive(graph, child, max_depth, current_depth + 1, out);
-        }
+        out.insert(
+            dep_path.clone(),
+            (child.name.clone(), child.version.clone()),
+        );
+        collect_transitive(graph, child, max_depth, current_depth + 1, out);
     }
 }
 

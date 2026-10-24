@@ -139,12 +139,9 @@ fn read_tarball_package_json(bytes: &[u8]) -> Result<Vec<u8>, String> {
 /// extracting the rest of the archive.
 pub(crate) struct LocalManifest {
     pub name: String,
-    /// SHA-512 of the `.tgz` for [`LocalSource::Tarball`] sources.
+    /// SHA-512 of the original local tarball.
     pub integrity: Option<String>,
-    /// `bundledDependencies` names, set only for tarballs: they ship the
-    /// bundled children inside the archive, while a directory import
-    /// leaves `node_modules` out.
-    pub bundled_dependencies: Vec<String>,
+    pub bundled_dependencies: Option<aube_manifest::BundledDependencies>,
     pub version: String,
     pub dependencies: BTreeMap<String, String>,
     pub optional_dependencies: BTreeMap<String, String>,
@@ -206,17 +203,9 @@ pub(crate) fn read_local_manifest(
             .entry(name.clone())
             .or_insert_with(|| "*".to_string());
     }
-    let bundled_dependencies = match (&pj.bundled_dependencies, local) {
-        (Some(bundled), LocalSource::Tarball(_)) => bundled
-            .names(&pj.dependencies)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
-    };
     Ok(LocalManifest {
         integrity,
-        bundled_dependencies,
+        bundled_dependencies: pj.bundled_dependencies,
         name: pj.name.unwrap_or_default(),
         version: pj.version.unwrap_or_else(|| "0.0.0".to_string()),
         dependencies: pj.dependencies,
@@ -1107,11 +1096,13 @@ mod local_tarball_manifest_tests {
             manifest.integrity,
             Some(aube_store::sha512_integrity(&bytes))
         );
-        assert_eq!(manifest.bundled_dependencies, ["a"]);
+        assert!(
+            matches!(manifest.bundled_dependencies, Some(aube_manifest::BundledDependencies::List(names)) if names == ["a"])
+        );
     }
 
     #[test]
-    fn local_directory_manifest_ignores_bundled_dependencies() {
+    fn local_directory_manifest_retains_the_bundle_declaration() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("pkg")).unwrap();
         std::fs::write(
@@ -1122,6 +1113,9 @@ mod local_tarball_manifest_tests {
         let manifest =
             read_local_manifest(&LocalSource::Directory("pkg".into()), dir.path()).unwrap();
         assert!(manifest.integrity.is_none());
-        assert!(manifest.bundled_dependencies.is_empty());
+        assert!(matches!(
+            manifest.bundled_dependencies,
+            Some(aube_manifest::BundledDependencies::All(true))
+        ));
     }
 }
