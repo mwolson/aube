@@ -174,14 +174,12 @@ fn dep_closure(
         let Some(pkg) = graph.packages.get(&dep_path) else {
             continue;
         };
-        // `LockedPackage.dependencies` values are dep_path *tails* —
-        // the string that follows `<name>@` in the child's dep_path.
-        // Recombine with the child name to rebuild the key we'll look
-        // up in `graph.packages`. Skipping this recombine would search
-        // the graph by the tail alone (e.g. `"6.0.0"`), miss every
-        // transitive, and `fetch --prod` would underreport its count.
         for (child_name, child_tail) in &pkg.dependencies {
-            let child_path = format!("{child_name}@{child_tail}");
+            let Some(child_path) = aube_lockfile::resolve_dep_edge(child_name, child_tail, |key| {
+                graph.packages.contains_key(key)
+            }) else {
+                continue;
+            };
             if seen.insert(child_path.clone()) {
                 queue.push_back(child_path);
             }

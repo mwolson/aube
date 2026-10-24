@@ -1994,12 +1994,9 @@ fn workspace_sibling_edges<'a>(
             pkg.dependencies.iter().filter_map(move |(name, tail)| {
                 let dir = workspace_dirs.get(name)?;
                 let key = format!("{name}@{tail}");
-                (!graph.packages.contains_key(&key)).then_some((
-                    owner.as_str(),
-                    key,
-                    name.as_str(),
-                    dir,
-                ))
+                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+                    .is_none()
+                    .then_some((owner.as_str(), key, name.as_str(), dir))
             })
         })
 }
