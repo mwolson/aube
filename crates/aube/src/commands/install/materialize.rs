@@ -461,6 +461,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
             let sem = sem.clone();
             let index = index.clone();
             let nested_link_targets = nested_link_targets.clone();
+            let graph = graph.clone();
             in_flight.push(tokio::spawn(async move {
                 let _diag_pkg =
                     aube_util::diag::Span::new(aube_util::diag::Category::Materialize, "package")
@@ -488,6 +489,7 @@ pub(super) async fn run_gvs_prewarm_materializer(
                     let mut stats = aube_linker::LinkStats::default();
                     linker
                         .ensure_in_virtual_store(
+                            &graph,
                             &dep_path,
                             &pkg,
                             &index,
@@ -640,6 +642,7 @@ async fn run_aube_dir_materializer(
             let index = index.clone();
             let aube_dir = aube_dir.clone();
             let nested_link_targets = nested_link_targets.clone();
+            let graph = graph.clone();
             in_flight.spawn(async move {
                 let permit = sem.acquire().await;
                 let dep_path_for_err = dep_path.clone();
@@ -647,6 +650,7 @@ async fn run_aube_dir_materializer(
                     let mut stats = aube_linker::LinkStats::default();
                     linker
                         .ensure_in_aube_dir(
+                            &graph,
                             &aube_dir,
                             &dep_path,
                             &pkg,

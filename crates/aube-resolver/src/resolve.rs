@@ -5,9 +5,7 @@ pub(crate) mod vulnerable;
 
 use crate::local_source::is_non_registry_specifier;
 use crate::semver_util::version_satisfies;
-use crate::{
-    Error, FxHashMap, PeerContextOptions, ReadPackageHook, Resolver, apply_peer_contexts, catalog,
-};
+use crate::{Error, FxHashMap, PeerContextOptions, ReadPackageHook, Resolver, catalog};
 use aube_lockfile::{DirectDep, LockedPackage, LockfileGraph};
 use aube_manifest::PackageJson;
 use aube_registry::VersionMetadata;
@@ -131,6 +129,7 @@ impl Resolver {
     /// peers when `auto_install_peers` is on, and applies peer-context
     /// suffixes. Returns the post-peer-context graph ready for lockfile
     /// emission.
+    #[allow(clippy::too_many_arguments)]
     fn finalize_resolved_graph(
         &self,
         importers: BTreeMap<String, Vec<DirectDep>>,
@@ -139,6 +138,7 @@ impl Resolver {
         resolved_times: BTreeMap<String, String>,
         skipped_optional_dependencies: BTreeMap<String, BTreeMap<String, String>>,
         catalog_picks: BTreeMap<String, BTreeMap<String, String>>,
+        previous: Option<&LockfileGraph>,
     ) -> Result<LockfileGraph, Error> {
         let resolved_catalogs =
             catalog::materialize_catalog_picks(catalog_picks, resolved_versions);
@@ -192,7 +192,12 @@ impl Resolver {
         };
         let _diag_peer =
             aube_util::diag::Span::new(aube_util::diag::Category::Resolver, "peer_context_apply");
-        let contextualized = apply_peer_contexts(canonical, &peer_options)?;
+        let contextualized = crate::peer_context::apply_peer_contexts_with_lockfile(
+            canonical,
+            &peer_options,
+            previous,
+            &self.peer_patch_hashes,
+        )?;
         drop(_diag_peer);
         tracing::debug!(
             "peer-context pass produced {} contextualized packages",

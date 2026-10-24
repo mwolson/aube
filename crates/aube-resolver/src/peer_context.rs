@@ -42,18 +42,13 @@ pub struct UnmetPeer {
     pub found: Option<String>,
 }
 
-/// Scan the resolved graph and return every declared required peer whose
-/// resolved version doesn't satisfy its declared range. Optional peers
-/// (`peerDependenciesMeta.optional = true`) are skipped — pnpm treats
-/// those as "warn suppressed" with `auto-install-peers=true`. The result
-/// is purely informational; aube never fails an install on unmet peers,
-/// matching pnpm.
+/// Scan declared peers for missing required providers and incompatible
+/// provided versions. Missing optional peers are allowed; a provided optional
+/// peer still reports a version mismatch, matching pnpm.
 ///
 /// The "found" version for each package comes from its own
-/// `dependencies` map — the peer-context pass writes the resolved peer
-/// tail there, so we don't have to re-walk ancestors. Any peer suffix on
-/// the stored tail is stripped before the semver check so `18.2.0(foo@1)`
-/// is treated as `18.2.0`.
+/// `dependencies` map. Resolve that edge to the provider's manifest version
+/// so source identities and peer suffixes never participate in semver checks.
 pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
     let mut unmet = Vec::new();
     for pkg in graph.packages.values() {
@@ -63,12 +58,12 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
                 .get(peer_name)
                 .map(|m| m.optional)
                 .unwrap_or(false);
-            if optional {
+            let found_tail = pkg.dependencies.get(peer_name);
+            if optional && found_tail.is_none() {
                 continue;
             }
-
-            let found_tail = pkg.dependencies.get(peer_name);
-            let found_version = found_tail.map(|t| canonical_tail(t).to_string());
+            let found_version =
+                found_tail.map(|tail| peer_provider(graph, peer_name, tail).version);
 
             let satisfied = match &found_version {
                 Some(v) => version_satisfies(v, declared_range),
@@ -363,6 +358,22 @@ pub fn apply_peer_contexts(
     canonical: LockfileGraph,
     options: &PeerContextOptions,
 ) -> Result<LockfileGraph, crate::Error> {
+    // Parsed pnpm graphs carry hashes; other formats may carry patch paths.
+    let patch_hashes = canonical
+        .patched_dependencies
+        .iter()
+        .filter(|(_, value)| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    apply_peer_contexts_with_lockfile(canonical, options, None, &patch_hashes)
+}
+
+pub(crate) fn apply_peer_contexts_with_lockfile(
+    canonical: LockfileGraph,
+    options: &PeerContextOptions,
+    previous: Option<&LockfileGraph>,
+    patch_hashes: &BTreeMap<String, String>,
+) -> Result<LockfileGraph, crate::Error> {
     const MIN_ITERATIONS: usize = 16;
     const MAX_ITERATIONS: usize = 256;
     // Each pass can propagate one more nested peer suffix through a chain.
@@ -415,8 +426,15 @@ pub fn apply_peer_contexts(
     // Remembers what each `(<short-hash>)` suffix stands for so the
     // cycle breaker can still see through it on later iterations.
     let mut hashed_suffixes = HashedSuffixes::default();
+    let mut missing_contexts = BTreeMap::new();
     for i in 0..iteration_limit {
-        let after_once = apply_peer_contexts_once(current, options, &mut hashed_suffixes);
+        let after_once = apply_peer_contexts_once(
+            current,
+            options,
+            &mut hashed_suffixes,
+            previous,
+            &mut missing_contexts,
+        );
         let next = if dedupe {
             dedupe_peer_variants(after_once)
         } else {
@@ -464,7 +482,8 @@ pub fn apply_peer_contexts(
     // are stable, and before `dedupe_peer_suffixes` so the latter's
     // `(name@version)` → `(version)` collapse acts on the propagated
     // form too.
-    let current = propagate_peer_suffixes_to_ancestors(current, options);
+    let current =
+        propagate_peer_suffixes_to_ancestors(current, options, &missing_contexts, patch_hashes);
     // `dedupe-peers=true` rewrites the parenthesized peer suffix to
     // drop the `name@` prefix. Done as a post-pass rather than inline
     // so cycle detection during the fixed-point loop keeps the full
@@ -763,7 +782,10 @@ fn apply_peer_contexts_once(
     canonical: LockfileGraph,
     options: &PeerContextOptions,
     hashed_suffixes: &mut HashedSuffixes,
+    previous: Option<&LockfileGraph>,
+    missing_contexts: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> LockfileGraph {
+    missing_contexts.clear();
     let mut out_packages: BTreeMap<String, LockedPackage> = BTreeMap::new();
     let mut new_importers: BTreeMap<String, Vec<DirectDep>> = BTreeMap::new();
 
@@ -795,6 +817,27 @@ fn apply_peer_contexts_once(
         .map(|deps| scope_map_from_deps(&canonical, deps))
         .unwrap_or_default();
 
+    let previous_importers: BTreeMap<_, FxHashMap<_, _>> = previous
+        .into_iter()
+        .flat_map(|graph| &graph.importers)
+        .map(|(path, deps)| {
+            (
+                path.as_str(),
+                deps.iter().map(|dep| (dep.name.as_str(), dep)).collect(),
+            )
+        })
+        .collect();
+    let empty_previous = FxHashMap::default();
+    let changed_root = if options.resolve_from_workspace_root {
+        changed_direct_providers(
+            &canonical,
+            canonical.importers.get(".").map_or(&[], Vec::as_slice),
+            previous_importers.get(".").unwrap_or(&empty_previous),
+        )
+    } else {
+        BTreeSet::new()
+    };
+
     for (importer_path, direct_deps) in &canonical.importers {
         // An importer's own direct deps are in scope for its children's
         // peer resolution — this is how pnpm's "auto-install at the root"
@@ -807,6 +850,15 @@ fn apply_peer_contexts_once(
         // would make descendants look up keys that don't exist in the
         // (now-nested) graph.
         let importer_scope = scope_map_from_deps(&canonical, direct_deps);
+        let previous_deps = previous_importers
+            .get(importer_path.as_str())
+            .unwrap_or(&empty_previous);
+        let mut changed = if importer_path == "." && options.resolve_from_workspace_root {
+            changed_root.clone()
+        } else {
+            changed_direct_providers(&canonical, direct_deps, previous_deps)
+        };
+        changed.extend(changed_root.iter().cloned());
 
         let mut new_deps = Vec::with_capacity(direct_deps.len());
         for dep in direct_deps {
@@ -824,6 +876,14 @@ fn apply_peer_contexts_once(
             // insertion before the recursion unwinds, so by the time
             // anything reads the graph, every referenced dep_path exists.
             let mut visiting: FxHashSet<String> = FxHashSet::default();
+            let previous_dep = previous_deps
+                .get(dep.name.as_str())
+                .filter(|old| canonical_tail(&old.dep_path) == canonical_tail(&dep.dep_path));
+            let locked_context = LockedPeerContext {
+                graph: previous,
+                path: previous_dep.map(|dep| dep.dep_path.clone()),
+                must_win: changed.clone(),
+            };
             let new_dep_path = visit_peer_context(
                 &dep.dep_path,
                 &canonical,
@@ -835,6 +895,8 @@ fn apply_peer_contexts_once(
                 options,
                 hashed_suffixes,
                 &cyclic_peer_identities,
+                &locked_context,
+                missing_contexts,
             )
             .unwrap_or_else(|| dep.dep_path.clone());
             new_deps.push(DirectDep {
@@ -890,11 +952,7 @@ fn canonical_tail(s: &str) -> &str {
     s.split('(').next().unwrap_or(s)
 }
 
-/// A peer provider's graph target and semver identity.
-///
-/// Those are normally the same tail. For linked directories, the target
-/// remains the content-addressed local dep path while peer matching and
-/// suffixes use the target manifest's version.
+/// A peer provider's graph target, rendered identity, and manifest version.
 #[derive(Debug, Clone)]
 struct PeerProvider {
     /// Tail used to find and link the package in the graph.
@@ -902,29 +960,43 @@ struct PeerProvider {
     /// Registry name used in the consumer's peer suffix; differs from the
     /// alias a package is installed under.
     context_name: String,
-    /// Tail used for semver checks and the consumer's peer suffix.
+    /// Tail used in the consumer's peer suffix.
     context_tail: String,
+    /// Manifest version used for semver checks, independent of source identity.
+    version: String,
 }
 
 fn peer_provider(graph: &LockfileGraph, name: &str, target_tail: &str) -> PeerProvider {
     let package =
         aube_lockfile::resolve_dep_edge(name, target_tail, |key| graph.packages.contains_key(key))
             .and_then(|key| graph.packages.get(&key));
-    let context_tail = package
-        .filter(|pkg| {
-            matches!(
+    let context_name = package
+        .map_or(name, LockedPackage::registry_name)
+        .to_string();
+    let context_tail = package.map_or_else(
+        || target_tail.to_string(),
+        |pkg| {
+            if matches!(
                 pkg.local_source,
                 Some(LocalSource::Directory(_) | LocalSource::Link(_) | LocalSource::Portal(_))
-            )
-        })
-        .map(|pkg| pkg.version.clone())
-        .unwrap_or_else(|| target_tail.to_string());
+            ) {
+                pkg.version.clone()
+            } else {
+                pkg.dep_path
+                    .strip_prefix(&format!("{}@", pkg.name))
+                    .unwrap_or(target_tail)
+                    .to_string()
+            }
+        },
+    );
     PeerProvider {
         target_tail: target_tail.to_string(),
-        context_name: package
-            .map_or(name, LockedPackage::registry_name)
-            .to_string(),
+        context_name,
         context_tail,
+        version: package.map_or_else(
+            || canonical_tail(target_tail).to_string(),
+            |pkg| pkg.version.clone(),
+        ),
     }
 }
 
@@ -952,13 +1024,9 @@ fn scope_map_from_deps(
     out
 }
 
-/// True when `s` is a single hashed peer suffix `(<32 lowercase hex>)`
-/// as emitted by [`effective_peer_suffix`] once a suffix exceeds
-/// `peersSuffixMaxLength`. The hashed form discards the textual peer
-/// set, so the propagation pass recognizes such keys and leaves them
-/// untouched (their per-peer contribution can't be recovered). A real
-/// peer segment always contains `@`, so the all-hex check can't
-/// false-positive on a `(name@version)` group.
+/// Recognize the single short-hash suffix produced by `effective_peer_suffix`.
+/// Real peer segments contain `@`, so they cannot match this test helper.
+#[cfg(test)]
 pub(crate) fn is_hashed_peer_suffix(s: &str) -> bool {
     let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) else {
         return false;
@@ -1151,306 +1219,246 @@ fn peer_name_from_segment(seg: &str) -> Option<&str> {
 /// `@testing-library/react@14.0.0(@types/react@…)(react@…)(react-dom@…)`
 /// carries `@types/react`, which only its child `@types/react-dom` needs.
 ///
-/// Algorithm:
-///  1. Build a forward dep map: `pkg_key → [child_key]` from each
-///     LockedPackage's `dependencies`.
-///  2. Memoized DFS. For each node, compute
-///     `cumulative_segments = outer_paren_segments(node.key)` and union
-///     in `⋃ cumulative(child)`.
-///  3. Cycles short-circuit via a `visiting` guard — cycle members
-///     can't add new peers from each other beyond what reaches them
-///     through non-cycle paths, so returning the empty set on
-///     re-entry is safe (the non-cycle entry path computes the full
-///     set).
-///  4. Dedupe by peer name. Suppressed names: every peer name reachable
-///     transitively in self-segments (so `(helper@1(core@1))` covers
-///     `core` and a flat `(core@1)` from descendants is dropped) plus
-///     the package's own canonical name (mutual-peer cycle break).
-///  5. Build a rewrite map `old_key → new_key` and apply to package
-///     keys, dep edges (each dep's stored tail), and importer
-///     dep_paths.
+/// Dependency cycles use pnpm 12's canonical edge cut: within a strongly
+/// connected component, only edges to a later package identity contribute
+/// peers. Peer-provider cycles are separate: providers with cyclic peer names
+/// contribute bare name/version identities, while acyclic providers carry
+/// their complete final context.
 fn propagate_peer_suffixes_to_ancestors(
     mut graph: LockfileGraph,
     options: &PeerContextOptions,
+    missing_contexts: &BTreeMap<String, BTreeSet<String>>,
+    patch_hashes: &BTreeMap<String, String>,
 ) -> LockfileGraph {
-    // Names carried over from an older lockfile may no longer apply; this
-    // pass re-derives the inherited peers from the current graph.
-    for pkg in graph.packages.values_mut() {
-        pkg.transitive_peer_dependencies.clear();
-    }
-    // Forward dep map. Edges that don't resolve to a present package
-    // (e.g. an unresolved peer that `detect_unmet_peers` will warn
-    // about) are dropped — they can't contribute cumulative peers.
-    let mut forward: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // Per-package set of dependency names a package supplies itself
-    // (regular or optional). A peer a descendant needs is *resolved* at
-    // the nearest ancestor that supplies it, so the `(peer@version)`
-    // suffix must stop there — that supplier, and everything above it,
-    // stays bare. pnpm leaves e.g. `tinyglobby@0.2.17` bare because it
-    // lists `picomatch` in its own `dependencies` (resolving `fdir`'s
-    // optional peer); only `fdir` keeps the suffix. Without this gate the
-    // suffix leaks onto every ancestor up to the importer.
-    let mut provides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (key, pkg) in &graph.packages {
-        // Edges to the package's own declared peers are mirrored deps,
-        // not subtrees it owns: pnpm doesn't bubble the peer's own
-        // peers through them.
-        let children: Vec<String> = pkg
-            .dependencies
-            .iter()
-            .filter(|(n, _)| {
-                !pkg.peer_dependencies.contains_key(*n)
-                    && !pkg.peer_dependencies_meta.contains_key(*n)
-            })
-            .map(|(n, t)| format!("{n}@{t}"))
-            .filter(|k| graph.packages.contains_key(k))
-            .collect();
-        forward.insert(key.clone(), children);
-        // Peer suffix segments name the registry package, so an aliased
-        // supplier is also recorded by its `registry-name@version`
-        // identity. Matching the version keeps an unrelated provider of the
-        // same registry package (another version) from being suppressed.
-        let mut supplied: BTreeSet<String> = pkg
-            .dependencies
-            .iter()
-            .chain(pkg.optional_dependencies.iter())
-            .flat_map(|(name, tail)| {
-                let identity = graph
-                    .packages
-                    .get(&format!("{name}@{tail}"))
-                    .filter(|dep| dep.alias_of.is_some())
-                    .map(|dep| format!("{}@{}", dep.registry_name(), dep.version));
-                std::iter::once(name.clone()).chain(identity)
-            })
-            .collect();
-        if pkg.alias_of.is_some() {
-            supplied.insert(format!("{}@{}", pkg.registry_name(), pkg.version));
-        }
-        provides.insert(key.clone(), supplied);
-    }
-
-    // Memoized DFS. `cumulative` stores the by-name segment map per
-    // package key; `visiting` is the cycle-break stack.
-    let mut cumulative: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let mut visiting: BTreeSet<String> = BTreeSet::new();
+    let forward = peer_walk_children(&graph);
+    let provides: BTreeMap<String, BTreeSet<String>> = graph
+        .packages
+        .iter()
+        .map(|(key, pkg)| {
+            (
+                key.clone(),
+                pkg.dependencies
+                    .keys()
+                    .chain(pkg.optional_dependencies.keys())
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
 
     fn collect(
         key: &str,
+        graph: &LockfileGraph,
         forward: &BTreeMap<String, Vec<String>>,
         provides: &BTreeMap<String, BTreeSet<String>>,
-        cumulative: &mut BTreeMap<String, BTreeMap<String, String>>,
-        visiting: &mut BTreeSet<String>,
-    ) -> BTreeMap<String, String> {
-        if let Some(c) = cumulative.get(key) {
-            return c.clone();
+        missing_contexts: &BTreeMap<String, BTreeSet<String>>,
+        cumulative: &mut BTreeMap<String, BTreeMap<String, PeerProvider>>,
+    ) -> BTreeMap<String, PeerProvider> {
+        if let Some(peers) = cumulative.get(key) {
+            return peers.clone();
         }
-        if !visiting.insert(key.to_string()) {
-            // Cycle: contribute nothing. Whichever cycle member is
-            // first reached from outside the cycle will compute the
-            // full set; the visit guard cap on the others prevents
-            // infinite recursion. Edge case: a fully-isolated cycle
-            // never gets a non-cycle entry, in which case all members
-            // compute empty cumulatives — that's identical to their
-            // canonical state, so they get no rewrite. Acceptable.
-            return BTreeMap::new();
-        }
-
-        // Self-suffix segments. Each segment becomes one (name → segment)
-        // entry. Nested segments like `(react-dom@18.2.0(react@18.2.0))`
-        // are preserved as a single segment with the nested form intact.
-        let self_segments = outer_paren_segments(key);
-        let mut acc: BTreeMap<String, String> = BTreeMap::new();
-        for seg in &self_segments {
-            if let Some(name) = peer_name_from_segment(seg) {
-                acc.entry(name.to_string())
-                    .or_insert_with(|| seg.to_string());
-            }
-        }
-
-        // Names suppressed when merging child contributions:
-        //   1. Every peer name already listed at the top level of the
-        //      self segments, so a descendant doesn't flat-list it twice.
-        //      Names only nested inside another segment, like `zod` in
-        //      `(ai@7(zod@4))`, are still listed flat, as pnpm does.
-        //   2. The package's own canonical name — for mutual-peer
-        //      cycles `a` peers on `b` and `b` peers on `a`, the
-        //      descendant set lifts `(a@…)` back up onto `a` itself,
-        //      which would write `a@1.0.0(a@…)(b@…)`. Self-listing
-        //      isn't valid pnpm shape; suppress it.
-        let canonical_name = canonical_tail(key)
-            .rsplit_once('@')
-            .map(|(name, _ver)| name.to_string())
-            .unwrap_or_default();
-        let mut suppressed: BTreeSet<String> = acc.keys().cloned().collect();
-        if !canonical_name.is_empty() {
-            suppressed.insert(canonical_name);
-        }
-
-        // A peer this package supplies itself is resolved here, so it must
-        // neither decorate this package's dep_path nor propagate above it
-        // (pnpm stops the suffix at the supplier). This is what keeps a
-        // supplier like `tinyglobby` (and its non-peer ancestors) bare
-        // while `fdir`, which only *declares* the peer, keeps its suffix.
-        if let Some(supplied) = provides.get(key) {
-            suppressed.extend(supplied.iter().cloned());
-        }
-
-        // Child contributions.
-        if let Some(children) = forward.get(key) {
-            for child in children {
-                let child_peers = collect(child, forward, provides, cumulative, visiting);
-                for (name, seg) in child_peers {
-                    let identity = seg
-                        .strip_prefix('(')
-                        .and_then(|inner| inner.split(['(', ')']).next());
-                    if suppressed.contains(&name)
-                        || identity.is_some_and(|identity| suppressed.contains(identity))
-                    {
-                        continue;
-                    }
-                    acc.entry(name).or_insert(seg);
+        let pkg = &graph.packages[key];
+        let mut peers = BTreeMap::new();
+        for child in &forward[key] {
+            for (name, provider) in collect(
+                child,
+                graph,
+                forward,
+                provides,
+                missing_contexts,
+                cumulative,
+            ) {
+                if name != pkg.name
+                    && !provides[key].contains(&name)
+                    && !missing_contexts
+                        .get(key)
+                        .is_some_and(|missing| missing.contains(&name))
+                {
+                    peers.entry(name).or_insert(provider);
                 }
             }
         }
-        visiting.remove(key);
-        cumulative.insert(key.to_string(), acc.clone());
-        acc
-    }
-
-    // Compute cumulative for every package + every importer DirectDep
-    // root. Done in stable order so the lex-smaller old-key tiebreaker
-    // below is deterministic.
-    let pkg_keys: Vec<String> = graph.packages.keys().cloned().collect();
-    for key in &pkg_keys {
-        collect(key, &forward, &provides, &mut cumulative, &mut visiting);
-    }
-    for deps in graph.importers.values() {
-        for dep in deps {
-            collect(
-                &dep.dep_path,
-                &forward,
-                &provides,
-                &mut cumulative,
-                &mut visiting,
-            );
-        }
-    }
-
-    // Build rewrite map. A package's new key is its canonical_base
-    // (`name@version`) plus the cumulative segments concatenated in
-    // full-segment lex order — same order `apply_peer_contexts_once`
-    // already produces for self segments, so when a package's
-    // cumulative is identical to its self set the rewrite is a no-op
-    // and we skip it.
-    //
-    // Hashed-suffix keys (`name@version(<short-hash>)`, produced when a
-    // package's own peer suffix exceeded `peersSuffixMaxLength`) are
-    // left untouched. The hash form discards the textual peer set
-    // by design — `outer_paren_segments` can't recover its
-    // contribution, so any rewrite we built for it would either drop
-    // the hash entirely (losing identity) or merge an incomplete
-    // descendant set with the hashed self. Preserving the original
-    // form is the conservative choice; pnpm's parity gap in that
-    // regime is bounded by the hash collision space anyway.
-    //
-    // If the propagated suffix itself exceeds the cap, hash it the
-    // same way `visit_peer_context` does for self suffixes — keeps
-    // dep_path keys bounded across the whole graph.
-    // Peer names a package absorbed from its descendants (not its own
-    // suffix names). They end up in `transitivePeerDependencies`, and are
-    // recorded here because `dedupe_peers` later strips names from keys.
-    let mut inherited_peers: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // A key can embed another package's key in its suffix (and so can
-    // every ancestor that absorbs it), so the final form of a key depends
-    // on the final forms of the keys nested in it. Re-derive every key
-    // against the previous pass's rewrites until they stop changing.
-    // A key can't embed itself, so this converges in about as many passes
-    // as the deepest chain of embedded keys, which the package count
-    // bounds.
-    let mut rewrite: BTreeMap<String, String> = BTreeMap::new();
-    for _ in 0..=pkg_keys.len() {
-        let mut nested: Vec<(String, String)> = rewrite
-            .iter()
-            .map(|(old, new)| (format!("({old})"), format!("({new})")))
-            .collect();
-        nested.sort_by_key(|(old, _)| std::cmp::Reverse(old.len()));
-        let mut next: BTreeMap<String, String> = BTreeMap::new();
-        for key in &pkg_keys {
-            let Some(segments) = cumulative.get(key) else {
-                continue;
-            };
-            // Git / remote-tarball (globally-shareable) packages keep a bare
-            // dep_path keyed solely by their content-pinned URL — pnpm never
-            // appends a `(peer@ver)` suffix to a non-registry depPath. Every
-            // git/tarball key in a real pnpm-lock.yaml is bare even when its
-            // subtree resolves peers: e.g. `<pkg>@<url>` sits bare above a
-            // registry descendant like `<child>@6.5.1(@types/node@…)`.
-            // Absorbing a descendant's `(@types/node@…)` here would (a) diverge
-            // from the lockfile and (b) give the same content-identical tarball
-            // a different dep_path per consuming subtree, splitting the single
-            // shared global-virtual-store entry into duplicates (so one
-            // content-pinned singleton would load twice → "Cannot find
-            // module"). The descendant peers still propagate onto this node's
-            // *registry* ancestors through `cumulative`, so a registry parent
-            // keeps its own `(@types/node@…)` suffix; only the git/tarball node
-            // itself stays bare.
-            if graph
-                .packages
-                .get(key)
-                .and_then(|p| p.local_source.as_ref())
-                .is_some_and(|s| s.is_globally_shareable())
-            {
-                continue;
+        // Own peers win over inherited contributions. Keep aliases for
+        // transitivePeerDependencies and registry identities for suffixes.
+        for name in pkg.peer_dependencies.keys() {
+            if let Some(tail) = pkg.dependencies.get(name) {
+                peers.insert(name.clone(), peer_provider(graph, name, tail));
+            } else {
+                // Registry packages omit links to workspace-only providers.
+                // Retain the resolved identity even without a snapshot edge.
+                for segment in outer_paren_segments(key) {
+                    if peer_name_from_segment(segment) == Some(name.as_str()) {
+                        let tail = &segment[name.len() + 2..segment.len() - 1];
+                        peers.insert(name.clone(), peer_provider(graph, name, tail));
+                    }
+                }
             }
-            // Recorded before the hashed-key skip below: a key that can't be
-            // rewritten still inherits the peers its dependencies resolved.
-            let pkg = graph.packages.get(key);
-            let inherited: Vec<String> = segments
-                .keys()
-                .filter(|n| {
-                    !pkg.is_some_and(|p| {
-                        p.peer_dependencies.contains_key(n.as_str())
-                            || p.peer_dependencies_meta.contains_key(n.as_str())
+        }
+        peers.remove(&pkg.name);
+        cumulative.insert(key.to_string(), peers.clone());
+        peers
+    }
+
+    let mut cumulative = BTreeMap::new();
+    for key in graph.packages.keys() {
+        collect(
+            key,
+            &graph,
+            &forward,
+            &provides,
+            missing_contexts,
+            &mut cumulative,
+        );
+    }
+    let mut peer_names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut peer_edges = BTreeMap::new();
+    for (key, peers) in &cumulative {
+        peer_names
+            .entry(graph.packages[key].name.clone())
+            .or_default()
+            .extend(peers.keys().cloned());
+        peer_edges.insert(
+            key.clone(),
+            peers
+                .iter()
+                .filter_map(|(name, provider)| {
+                    aube_lockfile::resolve_dep_edge(name, &provider.target_tail, |key| {
+                        graph.packages.contains_key(key)
                     })
                 })
-                .cloned()
-                .collect();
-            if !inherited.is_empty() {
-                inherited_peers.insert(key.clone(), inherited);
-            }
-            let canonical = canonical_tail(key);
-            if is_hashed_peer_suffix(&key[canonical.len()..]) {
-                // Original key already carries the hashed suffix `(…)` — see
-                // comment above. Its textual peer set is irrecoverable, so
-                // leave the key untouched.
-                continue;
-            }
-            let mut parts: Vec<&str> = segments.values().map(String::as_str).collect();
-            parts.sort_unstable();
-            // A package this key embeds in its suffix, e.g.
-            // `consumer@1(parent@1(react@19))`, may itself have gained peers
-            // (`parent@1(react@19)(zod@4)`). Point at its final key before the
-            // length cap is applied to the whole suffix.
-            let mut suffix = parts.concat();
-            if !suffix.is_empty() {
-                suffix = nested
-                    .iter()
-                    .fold(suffix, |acc, (old, new)| acc.replace(old, new));
-            }
-            let effective_suffix = effective_peer_suffix(&suffix, options.peers_suffix_max_length);
-            let new_key = format!("{canonical}{effective_suffix}");
-            if new_key != *key {
-                next.insert(key.clone(), new_key);
-            }
-        }
-        if next == rewrite {
-            break;
-        }
-        rewrite = next;
+                .collect(),
+        );
+    }
+    let peer_components = strongly_connected_components(&peer_edges);
+    let name_components = strongly_connected_components(&peer_names);
+    let cyclic_names: BTreeSet<String> = peer_names
+        .iter()
+        .filter(|(name, peers)| {
+            peers
+                .iter()
+                .any(|peer| name_components.get(*name) == name_components.get(peer))
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    struct FinalContexts<'a> {
+        graph: &'a LockfileGraph,
+        patch_hashes: &'a BTreeMap<String, String>,
+        peers: &'a BTreeMap<String, BTreeMap<String, PeerProvider>>,
+        components: &'a BTreeMap<String, usize>,
+        cyclic_names: &'a BTreeSet<String>,
+        max_length: usize,
+        paths: BTreeMap<String, String>,
     }
 
-    if rewrite.is_empty() {
-        return graph;
+    impl FinalContexts<'_> {
+        fn dep_path(&mut self, key: &str) -> String {
+            if let Some(path) = self.paths.get(key) {
+                return path.clone();
+            }
+            let pkg = &self.graph.packages[key];
+            if pkg
+                .local_source
+                .as_ref()
+                .is_some_and(LocalSource::is_globally_shareable)
+            {
+                self.paths.insert(key.to_string(), key.to_string());
+                return key.to_string();
+            }
+            let mut parts = Vec::new();
+            for (alias, provider) in &self.peers[key] {
+                let target = aube_lockfile::resolve_dep_edge(alias, &provider.target_tail, |key| {
+                    self.graph.packages.contains_key(key)
+                });
+                let cyclic = self.cyclic_names.contains(alias)
+                    || target.as_ref().is_some_and(|target| {
+                        self.components.get(key) == self.components.get(target)
+                    });
+                let identity = if cyclic {
+                    format!(
+                        "{}@{}",
+                        provider.context_name,
+                        canonical_tail(&provider.context_tail)
+                    )
+                } else if let Some(target) = target
+                    && !matches!(
+                        self.graph.packages[&target].local_source,
+                        Some(LocalSource::Link(_) | LocalSource::Portal(_))
+                    )
+                {
+                    let path = self.dep_path(&target);
+                    let target_pkg = &self.graph.packages[&target];
+                    let tail = if let Some(
+                        local @ (LocalSource::Directory(_) | LocalSource::Tarball(_)),
+                    ) = &target_pkg.local_source
+                    {
+                        format!(
+                            "{}{}",
+                            local.specifier(),
+                            &path[canonical_tail(&path).len()..]
+                        )
+                    } else {
+                        path.strip_prefix(&format!("{}@", target_pkg.name))
+                            .unwrap_or(&provider.context_tail)
+                            .to_string()
+                    };
+                    let patch = self
+                        .patch_hashes
+                        .get(&format!(
+                            "{}@{}",
+                            target_pkg.registry_name(),
+                            target_pkg.version
+                        ))
+                        .or_else(|| self.patch_hashes.get(target_pkg.registry_name()));
+                    let tail = if let Some(hash) = patch {
+                        let head = canonical_tail(&tail);
+                        format!("{head}(patch_hash={hash}){}", &tail[head.len()..])
+                    } else {
+                        tail.to_string()
+                    };
+                    format!("{}@{tail}", provider.context_name)
+                } else {
+                    format!("{}@{}", provider.context_name, provider.context_tail)
+                };
+                parts.push(format!("({identity})"));
+            }
+            parts.sort_unstable();
+            let path = format!(
+                "{}{}",
+                canonical_tail(key),
+                effective_peer_suffix(&parts.concat(), self.max_length)
+            );
+            self.paths.insert(key.to_string(), path.clone());
+            path
+        }
+    }
+
+    let mut contexts = FinalContexts {
+        graph: &graph,
+        patch_hashes,
+        peers: &cumulative,
+        components: &peer_components,
+        cyclic_names: &cyclic_names,
+        max_length: options.peers_suffix_max_length,
+        paths: BTreeMap::new(),
+    };
+    for key in graph.packages.keys() {
+        contexts.dep_path(key);
+    }
+    let rewrite = contexts.paths;
+    let mut inherited_peers: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, pkg) in &mut graph.packages {
+        pkg.transitive_peer_dependencies.clear();
+        let inherited: Vec<String> = cumulative[key]
+            .keys()
+            .chain(missing_contexts.get(key).into_iter().flatten())
+            .filter(|name| {
+                !pkg.peer_dependencies.contains_key(*name)
+                    && !pkg.peer_dependencies_meta.contains_key(*name)
+            })
+            .cloned()
+            .collect();
+        inherited_peers.insert(key.clone(), inherited);
     }
 
     // Helper: rewrite a `dependencies` tail (the part after `name@`).
@@ -1552,6 +1560,89 @@ fn propagate_peer_suffixes_to_ancestors(
         extra_fields,
         workspace_extra_fields,
     }
+}
+
+/// Children whose external peers participate in pnpm 12's position walk.
+/// The canonical cycle cut is shared with unresolved-peer metadata propagation.
+pub(crate) fn peer_walk_children(graph: &LockfileGraph) -> BTreeMap<String, Vec<String>> {
+    let mut forward: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut canonical_forward: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, pkg) in &graph.packages {
+        let children: Vec<String> = pkg
+            .dependencies
+            .iter()
+            .filter(|(name, _)| {
+                !pkg.peer_dependencies.contains_key(*name)
+                    && !pkg.peer_dependencies_meta.contains_key(*name)
+            })
+            .filter_map(|(name, tail)| {
+                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            })
+            .collect();
+        canonical_forward
+            .entry(canonical_tail(key).to_string())
+            .or_default()
+            .extend(
+                children
+                    .iter()
+                    .map(|child| canonical_tail(child).to_string()),
+            );
+        forward.insert(key.clone(), children);
+    }
+    let dependency_components = strongly_connected_components(&canonical_forward);
+    for (key, children) in &mut forward {
+        let base = canonical_tail(key);
+        children.retain(|child| {
+            let child_base = canonical_tail(child);
+            child_base > base
+                || dependency_components.get(base) != dependency_components.get(child_base)
+        });
+    }
+
+    forward
+}
+
+/// Iterative Kosaraju over package identities or peer names. Include target-only
+/// vertices so peerless providers get distinct components too.
+fn strongly_connected_components(edges: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, usize> {
+    let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (from, targets) in edges {
+        reverse.entry(from).or_default();
+        for to in targets {
+            reverse.entry(to).or_default().push(from);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    for root in reverse.keys() {
+        let mut stack = vec![(*root, false)];
+        while let Some((node, finished)) = stack.pop() {
+            if finished {
+                order.push(node);
+            } else if seen.insert(node) {
+                stack.push((node, true));
+                if let Some(targets) = edges.get(node) {
+                    stack.extend(targets.iter().map(|target| (target.as_str(), false)));
+                }
+            }
+        }
+    }
+    let mut components = BTreeMap::new();
+    for root in order.into_iter().rev() {
+        if components.contains_key(root) {
+            continue;
+        }
+        let component = components.len();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if components.contains_key(node) {
+                continue;
+            }
+            components.insert(node.to_string(), component);
+            stack.extend(reverse[node].iter().copied());
+        }
+    }
+    components
 }
 
 /// Dedupe-peers post-pass: strip the `name@` prefix from every
@@ -1867,6 +1958,75 @@ fn cyclic_peer_identities(graph: &LockfileGraph) -> FxHashSet<String> {
         .collect()
 }
 
+fn changed_direct_providers(
+    graph: &LockfileGraph,
+    current: &[DirectDep],
+    previous: &FxHashMap<&str, &DirectDep>,
+) -> BTreeSet<String> {
+    current
+        .iter()
+        .filter(|current| {
+            previous.get(current.name.as_str()).is_none_or(|old| {
+                canonical_tail(&old.dep_path) != canonical_tail(&current.dep_path)
+                    || old.specifier != current.specifier
+            }) || graph
+                .packages
+                .get(&current.dep_path)
+                .is_some_and(|pkg| pkg.registry_name() != current.name)
+        })
+        .map(|dep| dep.name.clone())
+        .collect()
+}
+
+struct LockedPeerContext<'a> {
+    graph: Option<&'a LockfileGraph>,
+    path: Option<String>,
+    must_win: BTreeSet<String>,
+}
+
+impl LockedPeerContext<'_> {
+    fn package(&self) -> Option<&LockedPackage> {
+        self.graph?.packages.get(self.path.as_ref()?)
+    }
+
+    fn provider(&self, name: &str, range: &str, graph: &LockfileGraph) -> Option<PeerProvider> {
+        if self.must_win.contains(name) {
+            return None;
+        }
+        let tail = self.package()?.dependencies.get(name)?;
+        // pnpm only reuses context-free providers that remain in the new tree.
+        if tail != canonical_tail(tail) {
+            return None;
+        }
+        aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))?;
+        let provider = peer_provider(graph, name, tail);
+        version_satisfies(&provider.version, range).then_some(provider)
+    }
+
+    fn child(&self, name: &str, tail: &str, pkg: &LockedPackage) -> Self {
+        let old_tail = self.package().and_then(|old| old.dependencies.get(name));
+        let path = old_tail
+            .filter(|old| canonical_tail(old) == canonical_tail(tail))
+            .map(|old| format!("{name}@{old}"));
+        let mut must_win = self.must_win.clone();
+        for (alias, current) in &pkg.dependencies {
+            if pkg.declared_dependencies.contains_key(alias)
+                && self
+                    .package()
+                    .and_then(|old| old.dependencies.get(alias))
+                    .is_none_or(|old| canonical_tail(old) != canonical_tail(current))
+            {
+                must_win.insert(alias.clone());
+            }
+        }
+        Self {
+            graph: self.graph,
+            path,
+            must_win,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_peer_context<'g>(
     input_dep_path: &str,
@@ -1879,6 +2039,8 @@ fn visit_peer_context<'g>(
     options: &PeerContextOptions,
     hashed_suffixes: &mut HashedSuffixes,
     cyclic_peer_identities: &FxHashSet<String>,
+    locked_context: &LockedPeerContext<'_>,
+    missing_contexts: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Option<String> {
     let pkg = graph.packages.get(input_dep_path)?;
 
@@ -1933,13 +2095,11 @@ fn visit_peer_context<'g>(
     //   4. The current package's own `pkg.dependencies` entry,
     //      ignoring range satisfaction — symmetric to (3) for the
     //      BFS-installed case.
-    //   5. Workspace root scope (compatible) — `resolve-peers-from-
-    //      workspace-root` fallback for monorepos that pin shared
-    //      peers at the root.
+    //   5. Workspace root scope, even when incompatible, for the
+    //      `resolve-peers-from-workspace-root` fallback.
     //   6. A graph-wide scan: any package whose name matches and
     //      whose version satisfies the declared range. Last resort
     //      for nested-context callers when nothing closer has it.
-    //   7. Workspace root scope, ignoring range satisfaction.
     //
     // If nothing in the graph holds a version of this peer at all,
     // it's left out of the context entirely — `detect_unmet_peers`
@@ -1964,10 +2124,7 @@ fn visit_peer_context<'g>(
     let mut peer_context: Vec<(String, PeerProvider)> = Vec::new();
     for (peer_name, declared_range) in &pkg.peer_dependencies {
         let satisfies_declared = |provider: &PeerProvider| -> bool {
-            // The tail may carry a nested peer suffix on fixed-point
-            // iterations 2+; strip it before checking the semver.
-            let canonical = canonical_tail(&provider.context_tail);
-            version_satisfies(canonical, declared_range)
+            version_satisfies(&provider.version, declared_range)
         };
 
         let from_ancestor = ancestor_scope
@@ -2043,10 +2200,9 @@ fn visit_peer_context<'g>(
         // package's own auto-installed deps, or the workspace root, and
         // otherwise from any version already resolved elsewhere in the
         // graph that satisfies the range (even in an unrelated importer's
-        // subtree). A peer that is provided is linked even when its
-        // version is out of range, like a required peer; only the
-        // graph-wide scan is range-gated. That graph-wide lookup is part of
-        // pnpm's `dedupe-peer-dependents` pass, so it is off with the
+        // subtree). A provided peer is linked even when its version is
+        // incompatible, just like a required peer. The graph-wide lookup is
+        // part of pnpm's `dedupe-peer-dependents` pass, so it is off with the
         // setting off. A package nothing in the graph
         // satisfies (debug's `supports-color` when no `chalk@4` is
         // installed) stays unresolved and surfaces under
@@ -2055,28 +2211,19 @@ fn visit_peer_context<'g>(
             .peer_dependencies_meta
             .get(peer_name)
             .is_some_and(|m| m.optional);
-        let resolved = if is_optional {
-            from_ancestor
-                .or(from_pkg_deps)
-                .or(from_ancestor_incompatible)
-                .or(from_pkg_deps_incompatible)
-                .or(from_root)
-                .or(from_root_incompatible)
-                .or_else(|| {
-                    options
-                        .dedupe_peer_dependents
-                        .then(from_graph_scan)
-                        .flatten()
-                })
-        } else {
-            from_ancestor
-                .or(from_pkg_deps)
-                .or(from_ancestor_incompatible)
-                .or(from_pkg_deps_incompatible)
-                .or(from_root)
-                .or_else(from_graph_scan)
-                .or(from_root_incompatible)
-        };
+        let resolved = locked_context
+            .provider(peer_name, declared_range, graph)
+            .or(from_ancestor)
+            .or(from_pkg_deps)
+            .or(from_ancestor_incompatible)
+            .or(from_pkg_deps_incompatible)
+            .or(from_root)
+            .or(from_root_incompatible)
+            .or_else(|| {
+                (!is_optional || options.dedupe_peer_dependents)
+                    .then(from_graph_scan)
+                    .flatten()
+            });
         if let Some(provider) = resolved {
             peer_context.push((peer_name.clone(), provider));
         }
@@ -2139,6 +2286,33 @@ fn visit_peer_context<'g>(
         hashed_suffixes.insert(effective_suffix.clone(), suffix);
     }
     let contextualized = format!("{canonical_base}{effective_suffix}");
+
+    if let Some(old) = locked_context.package()
+        && old.dep_path == canonical_tail(&old.dep_path)
+        && old.peer_dependencies.is_empty()
+        && old.dependencies.len() == pkg.dependencies.len()
+        && old.dependencies.iter().all(|(name, tail)| {
+            pkg.dependencies
+                .get(name)
+                .is_some_and(|current| canonical_tail(current) == canonical_tail(tail))
+        })
+    {
+        // Dedupe can retarget a child to a richer peer variant without
+        // adding that child's peers to the parent's recorded peer ids.
+        let missing = old
+            .transitive_peer_dependencies
+            .iter()
+            .filter(|name| {
+                !ancestor_scope.contains_key(*name)
+                    && !(options.resolve_from_workspace_root && root_scope.contains_key(*name))
+                    && !pkg.dependencies.contains_key(*name)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        missing_contexts
+            .entry(contextualized.clone())
+            .or_insert(missing);
+    }
 
     if out_packages.contains_key(&contextualized) || visiting.contains(&contextualized) {
         return Some(contextualized);
@@ -2207,6 +2381,8 @@ fn visit_peer_context<'g>(
             options,
             hashed_suffixes,
             cyclic_peer_identities,
+            &locked_context.child(child_name, &lookup_tail, pkg),
+            missing_contexts,
         );
         let new_tail = match child_new {
             Some(new_dep_path) => new_dep_path
@@ -2239,6 +2415,8 @@ fn visit_peer_context<'g>(
             options,
             hashed_suffixes,
             cyclic_peer_identities,
+            &locked_context.child(peer_name, &provider.target_tail, pkg),
+            missing_contexts,
         );
         // A peer provider with no `packages:` entry is a workspace
         // package (the resolver only records a `DirectDep` for those).
@@ -2356,6 +2534,504 @@ mod tests {
             g.packages.insert(p.dep_path.clone(), p);
         }
         g
+    }
+
+    #[test]
+    fn unchanged_large_importer_retains_direct_dependencies() {
+        let mut graph = LockfileGraph::default();
+        let mut deps = Vec::new();
+        for i in 0..4000 {
+            let name = format!("pkg-{i:04}");
+            let pkg = locked(&name, &[]);
+            deps.push(DirectDep {
+                name,
+                dep_path: pkg.dep_path.clone(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".into()),
+            });
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        graph.importers.insert(".".into(), deps);
+        let previous = graph.clone();
+        let out = apply_peer_contexts_with_lockfile(
+            graph,
+            &PeerContextOptions::default(),
+            Some(&previous),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.importers["."]
+                .iter()
+                .map(|d| &d.dep_path)
+                .collect::<Vec<_>>(),
+            previous.importers["."]
+                .iter()
+                .map(|d| &d.dep_path)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(out.packages.len(), 4000);
+    }
+
+    #[test]
+    fn locked_peer_providers_follow_importer_and_parent_positions() {
+        // pnpm 12.14.0: a removed direct peer stays pinned while a hidden
+        // dependency still supplies it. Both direct and nested consumers retain it.
+        let mut graph = LockfileGraph::default();
+        let mut consumer = locked("consumer", &[("peer", "1.0.0")]);
+        consumer.peer_dependencies.insert("peer".into(), "*".into());
+        consumer
+            .peer_dependencies_meta
+            .insert("peer".into(), PeerDepMeta { optional: true });
+        consumer
+            .optional_dependencies
+            .insert("peer".into(), "1.0.0".into());
+        let mut peer_two = locked("peer", &[]);
+        peer_two.version = "2.0.0".into();
+        peer_two.dep_path = "peer@2.0.0".into();
+        for pkg in [
+            consumer,
+            locked("peer", &[]),
+            peer_two,
+            locked("hidden", &[("peer", "2.0.0")]),
+            locked("wrapper", &[("consumer", "1.0.0")]),
+        ] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        let direct = |name: &str, version: &str| DirectDep {
+            name: name.into(),
+            dep_path: format!("{name}@{version}"),
+            specifier: Some(version.into()),
+            dep_type: DepType::Production,
+        };
+        graph.importers.insert(
+            ".".into(),
+            vec![direct("consumer", "1.0.0"), direct("peer", "1.0.0")],
+        );
+        for (importer, name) in [
+            ("packages/direct", "consumer"),
+            ("packages/nested", "wrapper"),
+        ] {
+            graph.importers.insert(
+                importer.into(),
+                vec![
+                    direct(name, "1.0.0"),
+                    direct("peer", "2.0.0"),
+                    direct("hidden", "1.0.0"),
+                ],
+            );
+        }
+        let options = PeerContextOptions {
+            resolve_from_workspace_root: false,
+            ..Default::default()
+        };
+        let previous = apply_peer_contexts(graph.clone(), &options).unwrap();
+        for importer in ["packages/direct", "packages/nested"] {
+            graph
+                .importers
+                .get_mut(importer)
+                .unwrap()
+                .retain(|dep| dep.name != "peer");
+        }
+        let out = apply_peer_contexts_with_lockfile(
+            graph.clone(),
+            &options,
+            Some(&previous),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.importers["packages/direct"][0].dep_path,
+            "consumer@1.0.0(peer@2.0.0)"
+        );
+        let wrapper = &out.packages["wrapper@1.0.0(peer@2.0.0)"];
+        assert_eq!(wrapper.dependencies["consumer"], "1.0.0(peer@2.0.0)");
+        assert!(out.packages.contains_key("consumer@1.0.0(peer@1.0.0)"));
+
+        graph
+            .importers
+            .get_mut("packages/direct")
+            .unwrap()
+            .push(direct("peer", "1.0.0"));
+        let changed = apply_peer_contexts_with_lockfile(
+            graph.clone(),
+            &options,
+            Some(&previous),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            changed.importers["packages/direct"][0].dep_path,
+            "consumer@1.0.0(peer@1.0.0)"
+        );
+        graph.packages.remove("peer@2.0.0");
+        graph
+            .packages
+            .get_mut("hidden@1.0.0")
+            .unwrap()
+            .dependencies
+            .clear();
+        let stale =
+            apply_peer_contexts_with_lockfile(graph, &options, Some(&previous), &BTreeMap::new())
+                .unwrap();
+        assert!(!stale.packages.contains_key("consumer@1.0.0(peer@2.0.0)"));
+    }
+
+    #[test]
+    fn locked_bare_parent_keeps_child_dedupe_out_of_its_own_suffix() {
+        // pnpm 12.14.0's child dedupe can enrich a child without changing
+        // its parent's peer ids. This is a lockfile-reuse fixture.
+        let mut graph = LockfileGraph::default();
+        let mut consumer = locked("consumer", &[("peer", "1.0.0")]);
+        consumer.peer_dependencies.insert("peer".into(), "*".into());
+        consumer
+            .peer_dependencies_meta
+            .insert("peer".into(), PeerDepMeta { optional: true });
+        consumer
+            .optional_dependencies
+            .insert("peer".into(), "1.0.0".into());
+        for pkg in [
+            consumer,
+            locked("peer", &[]),
+            locked("parent", &[("consumer", "1.0.0")]),
+        ] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        let direct = |name: &str| DirectDep {
+            name: name.into(),
+            dep_path: format!("{name}@1.0.0"),
+            specifier: Some("1.0.0".into()),
+            dep_type: DepType::Production,
+        };
+        graph
+            .importers
+            .insert(".".into(), vec![direct("consumer"), direct("peer")]);
+        graph
+            .importers
+            .insert("packages/app".into(), vec![direct("parent")]);
+        let options = PeerContextOptions {
+            resolve_from_workspace_root: false,
+            ..Default::default()
+        };
+        let mut previous = apply_peer_contexts(graph.clone(), &options).unwrap();
+        let mut parent = previous
+            .packages
+            .remove("parent@1.0.0(peer@1.0.0)")
+            .unwrap();
+        parent.dep_path = "parent@1.0.0".into();
+        previous.packages.insert(parent.dep_path.clone(), parent);
+        previous.importers.get_mut("packages/app").unwrap()[0].dep_path = "parent@1.0.0".into();
+        let mut out = apply_peer_contexts_with_lockfile(
+            graph.clone(),
+            &options,
+            Some(&previous),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        crate::platform::mark_transitive_peer_dependencies(&mut out);
+        let parent = &out.packages["parent@1.0.0"];
+        assert_eq!(parent.dependencies["consumer"], "1.0.0(peer@1.0.0)");
+        assert_eq!(parent.transitive_peer_dependencies, ["peer"]);
+        graph
+            .importers
+            .get_mut("packages/app")
+            .unwrap()
+            .push(direct("peer"));
+        let provided =
+            apply_peer_contexts_with_lockfile(graph, &options, Some(&previous), &BTreeMap::new())
+                .unwrap();
+        assert!(provided.packages.contains_key("parent@1.0.0(peer@1.0.0)"));
+    }
+
+    #[test]
+    fn transitive_missing_peers_exclude_own_declarations_but_continue_upward() {
+        // pnpm 12.14.0 lists only other on metadata, but missing and other
+        // both remain transitive peers of its outer ancestor.
+        let mut graph = LockfileGraph::default();
+        let mut metadata = locked("metadata", &[("leaf", "1.0.0")]);
+        let mut leaf = locked("leaf", &[]);
+        for (pkg, names) in [
+            (&mut metadata, vec!["missing"]),
+            (&mut leaf, vec!["missing", "other"]),
+        ] {
+            for name in names {
+                pkg.peer_dependencies.insert(name.into(), "*".into());
+                pkg.peer_dependencies_meta
+                    .insert(name.into(), PeerDepMeta { optional: true });
+            }
+        }
+        for pkg in [metadata, leaf, locked("outer", &[("metadata", "1.0.0")])] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        graph.importers.insert(
+            ".".into(),
+            vec![DirectDep {
+                name: "outer".into(),
+                dep_path: "outer@1.0.0".into(),
+                specifier: Some("1.0.0".into()),
+                dep_type: DepType::Production,
+            }],
+        );
+        let mut out = apply_peer_contexts(graph, &PeerContextOptions::default()).unwrap();
+        crate::platform::mark_transitive_peer_dependencies(&mut out);
+        assert!(
+            out.packages["leaf@1.0.0"]
+                .transitive_peer_dependencies
+                .is_empty()
+        );
+        assert_eq!(
+            out.packages["metadata@1.0.0"].transitive_peer_dependencies,
+            ["other"]
+        );
+        assert_eq!(
+            out.packages["outer@1.0.0"].transitive_peer_dependencies,
+            ["missing", "other"]
+        );
+    }
+
+    #[test]
+    fn aliased_peer_uses_registry_identity_and_keeps_alias_edge() {
+        for nested in [false, true] {
+            let mut g = LockfileGraph::default();
+            let mut typescript = locked("typescript", &[]);
+            typescript.alias_of = Some("@tsc-rs/typescript".to_string());
+            if nested {
+                typescript
+                    .peer_dependencies
+                    .insert("core".to_string(), "*".to_string());
+            }
+            let mut consumer = locked("consumer", &[]);
+            consumer
+                .peer_dependencies
+                .insert("typescript".to_string(), "*".to_string());
+            for pkg in [
+                consumer,
+                typescript,
+                locked("core", &[]),
+                locked("parent", &[("consumer", "1.0.0")]),
+            ] {
+                g.importers
+                    .entry(".".to_string())
+                    .or_default()
+                    .push(DirectDep {
+                        name: pkg.name.clone(),
+                        dep_path: pkg.dep_path.clone(),
+                        dep_type: DepType::Production,
+                        specifier: Some("*".to_string()),
+                    });
+                g.packages.insert(pkg.dep_path.clone(), pkg);
+            }
+            let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+            let key = if nested {
+                "consumer@1.0.0(@tsc-rs/typescript@1.0.0(core@1.0.0))"
+            } else {
+                "consumer@1.0.0(@tsc-rs/typescript@1.0.0)"
+            };
+            let consumer = &out.packages[key];
+            let tail = if nested { "1.0.0(core@1.0.0)" } else { "1.0.0" };
+            assert_eq!(consumer.dependencies["typescript"], tail);
+            assert!(out.packages.contains_key(&format!("typescript@{tail}")));
+            assert!(detect_unmet_peers(&out).is_empty());
+            assert!(consumer.transitive_peer_dependencies.is_empty());
+            let parent_key = key.replacen("consumer@", "parent@", 1);
+            assert_eq!(
+                out.packages[&parent_key].transitive_peer_dependencies,
+                ["typescript"]
+            );
+        }
+    }
+
+    #[test]
+    fn incompatible_optional_peer_propagates_through_dependency_cycle() {
+        let mut g = graph_with_cousin_peer();
+        let plugin = g.packages.get_mut("plugin@1.0.0").expect("plugin");
+        plugin
+            .peer_dependencies
+            .insert("theme".to_string(), "^2".to_string());
+        plugin
+            .peer_dependencies_meta
+            .insert("theme".to_string(), PeerDepMeta { optional: true });
+        g.packages
+            .get_mut("sibling@1.0.0")
+            .expect("sibling")
+            .dependencies = [("app".to_string(), "1.0.0".to_string())].into();
+        g.importers.get_mut(".").expect("root").push(DirectDep {
+            name: "theme".to_string(),
+            dep_path: "theme@1.0.0".to_string(),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".to_string()),
+        });
+        let out = apply_peer_contexts(g, &PeerContextOptions::default()).expect("peer pass");
+        let app = &out.packages["app@1.0.0(theme@1.0.0)"];
+        assert_eq!(app.transitive_peer_dependencies, ["theme"]);
+        // pnpm 12 cuts sibling -> app, so this edge supplies no peers.
+        let sibling = &out.packages["sibling@1.0.0"];
+        assert!(sibling.transitive_peer_dependencies.is_empty());
+        assert_eq!(sibling.dependencies["app"], "1.0.0(theme@1.0.0)");
+    }
+
+    #[test]
+    fn peer_cycle_providers_use_bare_identities_even_for_outside_consumers() {
+        // Keys verified with pnpm 12.14.0 and 11.10.0 on a local registry.
+        for max_length in [1000, 1] {
+            let mut g = LockfileGraph::default();
+            for (name, peers) in [
+                ("r2-host", vec!["r2-color", "r2-plugin"]),
+                ("r2-plugin", vec!["r2-color", "r2-host"]),
+                ("r2-consumer", vec!["r2-host"]),
+                ("r2-color", vec![]),
+            ] {
+                let mut pkg = locked(name, &[]);
+                pkg.peer_dependencies = peers
+                    .into_iter()
+                    .map(|name| (name.to_string(), "*".to_string()))
+                    .collect();
+                g.importers
+                    .entry(".".to_string())
+                    .or_default()
+                    .push(DirectDep {
+                        name: name.to_string(),
+                        dep_path: pkg.dep_path.clone(),
+                        dep_type: DepType::Production,
+                        specifier: Some("1.0.0".to_string()),
+                    });
+                g.packages.insert(pkg.dep_path.clone(), pkg);
+            }
+            let out = apply_peer_contexts(
+                g.clone(),
+                &PeerContextOptions {
+                    peers_suffix_max_length: max_length,
+                    ..Default::default()
+                },
+            )
+            .expect("peer pass");
+            let (host, plugin, consumer) = if max_length == 1 {
+                (
+                    "r2-host@1.0.0(f813d3a7359f53ecc69ae6ad629ef736)",
+                    "r2-plugin@1.0.0(1358e8da63dceb7b4de4744e316d5489)",
+                    "r2-consumer@1.0.0(113cafeb2fbd38e575aa85615239a287)",
+                )
+            } else {
+                (
+                    "r2-host@1.0.0(r2-color@1.0.0)(r2-plugin@1.0.0)",
+                    "r2-plugin@1.0.0(r2-color@1.0.0)(r2-host@1.0.0)",
+                    "r2-consumer@1.0.0(r2-host@1.0.0)",
+                )
+            };
+            assert_eq!(
+                out.packages.keys().cloned().collect::<BTreeSet<_>>(),
+                [
+                    host.to_string(),
+                    plugin.to_string(),
+                    consumer.to_string(),
+                    "r2-color@1.0.0".to_string()
+                ]
+                .into()
+            );
+            assert_eq!(
+                out.packages[consumer].dependencies["r2-host"],
+                host.strip_prefix("r2-host@").expect("host tail")
+            );
+            assert_eq!(
+                out.packages[host].dependencies["r2-plugin"],
+                plugin.strip_prefix("r2-plugin@").expect("plugin tail")
+            );
+            assert_eq!(
+                out.packages[plugin].dependencies["r2-host"],
+                host.strip_prefix("r2-host@").expect("host tail")
+            );
+            let hash = "b1440f165806cc9e359186de511d388b3a72b66339550e31daacb7cd51046293";
+            g.patched_dependencies = [
+                ("r2-host@1.0.0".to_string(), hash.to_string()),
+                ("r2-color@1.0.0".to_string(), hash.to_string()),
+            ]
+            .into();
+            let patched = apply_peer_contexts(
+                g,
+                &PeerContextOptions {
+                    peers_suffix_max_length: max_length,
+                    ..Default::default()
+                },
+            )
+            .expect("patched peer pass");
+            let host = if max_length == 1 {
+                "r2-host@1.0.0(8de789d23e65a338c88ff90cc53dae1b)".to_string()
+            } else {
+                format!("r2-host@1.0.0(r2-color@1.0.0(patch_hash={hash}))(r2-plugin@1.0.0)")
+            };
+            assert!(patched.packages.contains_key(&host));
+            assert_eq!(
+                patched.packages[consumer].dependencies["r2-host"],
+                host.strip_prefix("r2-host@").expect("host tail")
+            );
+        }
+    }
+
+    #[test]
+    fn aliased_peer_hash_matches_pnpm() {
+        assert_eq!(
+            effective_peer_suffix("(@tsc-rs/typescript@1.0.0(core@1.0.0))", 1),
+            "(bc556ebb267d1c953f393e8346e65907)"
+        );
+    }
+
+    #[test]
+    fn provided_incompatible_peers_are_linked_and_propagated() {
+        for optional in [false, true] {
+            for root_fallback in [false, true] {
+                for dedupe_peer_dependents in [false, true] {
+                    let mut g = LockfileGraph::default();
+                    let mut consumer = locked("consumer", &[]);
+                    consumer
+                        .peer_dependencies
+                        .insert("peer".to_string(), "^2".to_string());
+                    if optional {
+                        consumer
+                            .peer_dependencies_meta
+                            .insert("peer".to_string(), PeerDepMeta { optional: true });
+                    }
+                    for pkg in [
+                        locked("parent", &[("consumer", "1.0.0")]),
+                        consumer,
+                        locked("peer", &[]),
+                    ] {
+                        g.packages.insert(pkg.dep_path.clone(), pkg);
+                    }
+                    for (importer, name) in [
+                        ("app", "parent"),
+                        (if root_fallback { "." } else { "app" }, "peer"),
+                    ] {
+                        g.importers
+                            .entry(importer.to_string())
+                            .or_default()
+                            .push(DirectDep {
+                                name: name.to_string(),
+                                dep_path: format!("{name}@1.0.0"),
+                                dep_type: DepType::Production,
+                                specifier: Some("1.0.0".to_string()),
+                            });
+                    }
+                    let out = apply_peer_contexts(
+                        g,
+                        &PeerContextOptions {
+                            dedupe_peer_dependents,
+                            ..PeerContextOptions::default()
+                        },
+                    )
+                    .expect("peer pass");
+                    let consumer = &out.packages["consumer@1.0.0(peer@1.0.0)"];
+                    assert_eq!(consumer.dependencies["peer"], "1.0.0");
+                    assert_eq!(
+                        consumer.optional_dependencies.contains_key("peer"),
+                        optional
+                    );
+                    let parent = &out.packages["parent@1.0.0(peer@1.0.0)"];
+                    assert_eq!(parent.transitive_peer_dependencies, ["peer"]);
+                    assert_eq!(parent.dependencies["consumer"], "1.0.0(peer@1.0.0)");
+                    assert_eq!(detect_unmet_peers(&out).len(), 1);
+                }
+            }
+        }
     }
 
     #[test]
