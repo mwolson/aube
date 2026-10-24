@@ -90,9 +90,29 @@ fn ref_bin_map(v: &Value) -> BTreeMap<String, String> {
         }
         Value::Object(m) => m
             .iter()
-            .filter_map(|(k, v)| match v {
-                Value::String(s) => Some((k.clone(), s.clone())),
-                _ => None,
+            .filter_map(|(key, value)| {
+                let target = value.as_str()?.replace('\\', "/");
+                let key = key.replace(['\\', ':'], "/");
+                let key = key.trim_end_matches('/').rsplit('/').next()?;
+                if ["", ".", "..", "__proto__"].contains(&key) {
+                    return None;
+                }
+                let mut parts = Vec::new();
+                for segment in target.split('/') {
+                    if segment == ".." {
+                        parts.pop();
+                    } else if !segment.is_empty() && segment != "." {
+                        parts.push(segment);
+                    }
+                }
+                if parts.is_empty() {
+                    return None;
+                }
+                let mut clean = parts.join("/");
+                if target.ends_with('/') {
+                    clean.push('/');
+                }
+                Some((key.to_owned(), clean))
             })
             .collect(),
         _ => BTreeMap::new(),

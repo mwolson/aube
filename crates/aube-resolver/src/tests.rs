@@ -765,6 +765,7 @@ fn make_version(name: &str, version: &str) -> VersionMetadata {
         engines: BTreeMap::new(),
         license: None,
         funding_url: None,
+        funding: None,
         bin: BTreeMap::new(),
         has_install_script: false,
         deprecated: None,
@@ -4737,6 +4738,86 @@ async fn deprecated_reason_recorded_even_when_warning_suppressed() {
         Some("use bar instead"),
         "lockfile must record deprecated even when the warning is suppressed"
     );
+}
+
+#[tokio::test]
+async fn fresh_npm_entries_keep_registry_install_script_flags() {
+    for has_script in [false, true] {
+        let mut packument = make_packument("foo", &["1.0.0"], "1.0.0");
+        let metadata = packument.versions.get_mut("1.0.0").unwrap();
+        metadata.has_install_script = has_script;
+        metadata.deprecated = Some("use bar instead".into());
+        let client = Arc::new(aube_registry::client::RegistryClient::new(
+            "http://127.0.0.1:0",
+        ));
+        let mut resolver = Resolver::new(client);
+        resolver.cache.insert("foo".into(), packument.into());
+        let manifest = PackageJson {
+            dependencies: [("foo".into(), "1.0.0".into())].into(),
+            ..Default::default()
+        };
+        let graph = resolver.resolve(&manifest, None).await.unwrap();
+        assert_eq!(
+            graph.packages["foo@1.0.0"].extra_meta["deprecated"],
+            "use bar instead"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package-lock.json");
+        aube_lockfile::npm::write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            lock["packages"]["node_modules/foo"].get("hasInstallScript"),
+            has_script.then_some(&serde_json::Value::Bool(true)),
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_npm_entries_keep_full_metadata() {
+    for funding in [
+        serde_json::json!("https://example.com/string"),
+        serde_json::json!({"type":"opencollective","url":"https://example.com/object"}),
+        serde_json::json!(["https://example.com/one", {"type":"github","url":"https://example.com/two"}]),
+    ] {
+        let metadata: aube_registry::VersionMetadata = serde_json::from_value(serde_json::json!({
+            "name":"@fixture/metadata","version":"1.0.0","bin":"./cli.js",
+            "funding":funding,"deprecated":"use another package","libc":["glibc"],
+            "hasInstallScript":true
+        }))
+        .unwrap();
+        let mut packument = make_packument("@fixture/metadata", &["1.0.0"], "1.0.0");
+        packument.versions.insert("1.0.0".into(), metadata);
+        let client = Arc::new(aube_registry::client::RegistryClient::new(
+            "http://127.0.0.1:0",
+        ));
+        let mut resolver = Resolver::new(client);
+        resolver
+            .cache
+            .insert("@fixture/metadata".into(), packument.into());
+        let manifest = PackageJson {
+            dependencies: [("@fixture/metadata".into(), "1.0.0".into())].into(),
+            ..Default::default()
+        };
+        let graph = resolver.resolve(&manifest, None).await.unwrap();
+        assert_eq!(graph.packages["@fixture/metadata@1.0.0"].libc[0], "glibc");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package-lock.json");
+        aube_lockfile::npm::write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let entry = &lock["packages"]["node_modules/@fixture/metadata"];
+        assert_eq!(entry["bin"], serde_json::json!({"metadata":"cli.js"}));
+        let expected_funding = if let Some(url) = funding.as_str() {
+            serde_json::json!({"url":url})
+        } else {
+            funding
+        };
+        assert_eq!(entry["funding"], expected_funding);
+        assert_eq!(entry["deprecated"], "use another package");
+        assert!(entry.get("libc").is_none());
+        assert_eq!(entry["hasInstallScript"], true);
+    }
 }
 
 // ===== peersSuffixMaxLength =====

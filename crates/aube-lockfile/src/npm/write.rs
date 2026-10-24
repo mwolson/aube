@@ -60,8 +60,8 @@ struct WriteNpmPackage<'a> {
     os: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    libc: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deprecated: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     funding: Option<serde_json::Value>,
     /// The root manifest's `workspaces` field, copied verbatim as npm
@@ -555,7 +555,10 @@ pub fn write(
                     license: pkg.license.as_deref(),
                     os: pkg.os.to_vec(),
                     cpu: pkg.cpu.to_vec(),
-                    libc: pkg.libc.to_vec(),
+                    deprecated: pkg
+                        .extra_meta
+                        .get("deprecated")
+                        .and_then(serde_json::Value::as_str),
                     funding: npm_funding(pkg),
                     dev,
                     optional,
@@ -594,7 +597,10 @@ pub fn write(
                     .collect(),
                 os: pkg.os.to_vec(),
                 cpu: pkg.cpu.to_vec(),
-                libc: pkg.libc.to_vec(),
+                deprecated: pkg
+                    .extra_meta
+                    .get("deprecated")
+                    .and_then(serde_json::Value::as_str),
                 funding: npm_funding(pkg),
                 dev,
                 optional,
@@ -882,10 +888,11 @@ fn directory_target(dir: &Path) -> String {
 }
 
 /// The `funding` value to write: the verbatim value read from an existing
-/// package-lock.json wins, since a freshly resolved entry only knows the URL.
+/// package-lock.json or full registry manifest wins over the URL-only fallback.
 fn npm_funding(pkg: &LockedPackage) -> Option<serde_json::Value> {
     pkg.extra_meta
         .get(crate::EXTRA_NPM_FUNDING)
+        .filter(|value| npm_meta_value(value))
         .cloned()
         .or_else(|| {
             pkg.funding_url
@@ -897,19 +904,23 @@ fn npm_funding(pkg: &LockedPackage) -> Option<serde_json::Value> {
 /// A project manifest's `funding`, verbatim, skipped the way npm's
 /// `metaFieldFromPkg` skips it: falsy values and empty objects or arrays.
 fn manifest_funding(manifest: &aube_manifest::PackageJson) -> Option<serde_json::Value> {
-    use serde_json::Value;
     manifest
         .extra
         .get("funding")
-        .filter(|value| match value {
-            Value::Null | Value::Bool(false) => false,
-            Value::String(s) => !s.is_empty(),
-            Value::Number(n) => n.as_f64() != Some(0.0),
-            Value::Array(items) => !items.is_empty(),
-            Value::Object(map) => !map.is_empty(),
-            Value::Bool(true) => true,
-        })
+        .filter(|value| npm_meta_value(value))
         .cloned()
+}
+
+fn npm_meta_value(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(true) => true,
+    }
 }
 
 fn has_install_script(pkg: &LockedPackage) -> bool {

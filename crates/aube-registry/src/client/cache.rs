@@ -11,7 +11,39 @@ pub(super) struct CachedPackument {
     pub(super) fetched_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) max_age_secs: Option<u64>,
+    #[serde(deserialize_with = "CachedPackumentData::deserialize")]
     pub(super) packument: Packument,
+}
+
+// Registry object bins reject empty command names. Typed caches written by older
+// versions use that key for an implicit package-name bin, so decode them separately.
+#[derive(Deserialize)]
+#[serde(remote = "Packument")]
+struct CachedPackumentData {
+    name: String,
+    #[serde(default)]
+    modified: Option<String>,
+    #[serde(default, deserialize_with = "cached_versions")]
+    versions: std::collections::BTreeMap<String, crate::VersionMetadata>,
+    #[serde(
+        rename = "dist-tags",
+        default,
+        deserialize_with = "crate::non_string_tolerant_map"
+    )]
+    dist_tags: std::collections::BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "crate::non_string_tolerant_map")]
+    time: std::collections::BTreeMap<String, String>,
+}
+
+fn cached_versions<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<std::collections::BTreeMap<String, crate::VersionMetadata>, D::Error> {
+    let versions =
+        std::collections::BTreeMap::<String, crate::VersionMetadataRaw<true>>::deserialize(de)?;
+    Ok(versions
+        .into_iter()
+        .map(|(key, raw)| (key, raw.into()))
+        .collect())
 }
 
 /// Validated JSON retained without allocating a tree of arbitrary fields.
@@ -417,4 +449,33 @@ pub(super) fn write_cached_full_packument<T: Serialize>(
     })
     .map_err(std::io::Error::other)?;
     aube_util::fs_atomic::atomic_write(path, &json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_cached_string_bin_sentinels_survive_rewrite() {
+        for name in ["string-cli", "@fixture/metadata"] {
+            let legacy = serde_json::json!({
+                "etag":null, "last_modified":null, "fetched_at":1,
+                "packument":{"name":name,"versions":{"1.0.0":{
+                    "name":name,"version":"1.0.0","bin":{"":"./cli.js"}
+                }}}
+            });
+            let cached: CachedPackument =
+                sonic_rs::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+            let metadata = &cached.packument.versions["1.0.0"];
+            assert_eq!(metadata.bin.get("").map(String::as_str), Some("./cli.js"));
+            let expected = crate::normalize_bin(name, &metadata.bin);
+            let rewritten = sonic_rs::to_vec(&cached).unwrap();
+            let back: CachedPackument = sonic_rs::from_slice(&rewritten).unwrap();
+            assert_eq!(
+                crate::normalize_bin(name, &back.packument.versions["1.0.0"].bin),
+                expected
+            );
+            assert_eq!(back.packument.versions["1.0.0"].bin, metadata.bin);
+        }
+    }
 }
