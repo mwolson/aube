@@ -25,6 +25,9 @@ pub(crate) use layout::{
     dep_value_as_version, segments_to_install_path,
 };
 pub use raw::BUNDLED_OPTIONAL_KEY;
+pub(crate) use raw::{
+    BUNDLED_ENTRIES_KEY, ENTRY_METADATA_KEY, RETAINED_ENTRIES_KEY, WORKSPACES_KEY,
+};
 pub use read::parse;
 pub use write::{write, write_with_project_root};
 

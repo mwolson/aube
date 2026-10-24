@@ -765,6 +765,7 @@ fn make_version(name: &str, version: &str) -> VersionMetadata {
         engines: BTreeMap::new(),
         license: None,
         funding_url: None,
+        funding: None,
         bin: BTreeMap::new(),
         has_install_script: false,
         deprecated: None,
@@ -5033,6 +5034,86 @@ async fn deprecated_reason_recorded_even_when_warning_suppressed() {
     );
 }
 
+#[tokio::test]
+async fn fresh_npm_entries_keep_registry_install_script_flags() {
+    for has_script in [false, true] {
+        let mut packument = make_packument("foo", &["1.0.0"], "1.0.0");
+        let metadata = packument.versions.get_mut("1.0.0").unwrap();
+        metadata.has_install_script = has_script;
+        metadata.deprecated = Some("use bar instead".into());
+        let client = Arc::new(aube_registry::client::RegistryClient::new(
+            "http://127.0.0.1:0",
+        ));
+        let mut resolver = Resolver::new(client);
+        resolver.cache.insert("foo".into(), packument.into());
+        let manifest = PackageJson {
+            dependencies: [("foo".into(), "1.0.0".into())].into(),
+            ..Default::default()
+        };
+        let graph = resolver.resolve(&manifest, None).await.unwrap();
+        assert_eq!(
+            graph.packages["foo@1.0.0"].extra_meta["deprecated"],
+            "use bar instead"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package-lock.json");
+        aube_lockfile::npm::write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            lock["packages"]["node_modules/foo"].get("hasInstallScript"),
+            has_script.then_some(&serde_json::Value::Bool(true)),
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_npm_entries_keep_full_metadata() {
+    for funding in [
+        serde_json::json!("https://example.com/string"),
+        serde_json::json!({"type":"opencollective","url":"https://example.com/object"}),
+        serde_json::json!(["https://example.com/one", {"type":"github","url":"https://example.com/two"}]),
+    ] {
+        let metadata: aube_registry::VersionMetadata = serde_json::from_value(serde_json::json!({
+            "name":"@fixture/metadata","version":"1.0.0","bin":"./cli.js",
+            "funding":funding,"deprecated":"use another package","libc":["glibc"],
+            "hasInstallScript":true
+        }))
+        .unwrap();
+        let mut packument = make_packument("@fixture/metadata", &["1.0.0"], "1.0.0");
+        packument.versions.insert("1.0.0".into(), metadata);
+        let client = Arc::new(aube_registry::client::RegistryClient::new(
+            "http://127.0.0.1:0",
+        ));
+        let mut resolver = Resolver::new(client);
+        resolver
+            .cache
+            .insert("@fixture/metadata".into(), packument.into());
+        let manifest = PackageJson {
+            dependencies: [("@fixture/metadata".into(), "1.0.0".into())].into(),
+            ..Default::default()
+        };
+        let graph = resolver.resolve(&manifest, None).await.unwrap();
+        assert_eq!(graph.packages["@fixture/metadata@1.0.0"].libc[0], "glibc");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("package-lock.json");
+        aube_lockfile::npm::write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let entry = &lock["packages"]["node_modules/@fixture/metadata"];
+        assert_eq!(entry["bin"], serde_json::json!({"metadata":"cli.js"}));
+        let expected_funding = if let Some(url) = funding.as_str() {
+            serde_json::json!({"url":url})
+        } else {
+            funding
+        };
+        assert_eq!(entry["funding"], expected_funding);
+        assert_eq!(entry["deprecated"], "use another package");
+        assert!(entry.get("libc").is_none());
+        assert_eq!(entry["hasInstallScript"], true);
+    }
+}
+
 // ===== peersSuffixMaxLength =====
 //
 // Helpers exercised directly: `effective_peer_suffix` for the pnpm
@@ -6981,4 +7062,73 @@ async fn review_round12_npm_nested_override_below_direct_parent_is_kept() {
     let graph = resolver.resolve(&manifest, Some(&existing)).await.unwrap();
     assert_eq!(graph.packages["mid@1.0.0"].dependencies["child"], "2.0.0");
     assert!(!graph.packages.contains_key("child@1.0.0"));
+}
+
+#[tokio::test]
+async fn bun_writer_preserves_registry_bin_paths() {
+    let client = Arc::new(aube_registry::client::RegistryClient::new(
+        "http://127.0.0.1:0",
+    ));
+    let mut resolver = Resolver::new(client);
+    let mut manifest = PackageJson::default();
+    for (name, bin) in [
+        ("@fixture/metadata", serde_json::json!("./cli.js")),
+        ("object-bin", serde_json::json!({"meta-cli": "./cli.js"})),
+        (
+            "empty-key",
+            serde_json::json!({"": "./x.js", "b": "./b.js"}),
+        ),
+    ] {
+        let packument: aube_registry::Packument = serde_json::from_value(serde_json::json!({
+            "name": name, "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": name, "version": "1.0.0", "bin": bin}}
+        }))
+        .unwrap();
+        resolver.cache.insert(name.to_string(), packument.into());
+        manifest.dependencies.insert(name.into(), "1.0.0".into());
+    }
+    let graph = resolver.resolve(&manifest, None).await.unwrap();
+    assert_eq!(
+        graph.packages["empty-key@1.0.0"].bin,
+        [
+            ("b".into(), "./b.js".into()),
+            ("empty-key".into(), "./x.js".into())
+        ]
+        .into()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for filename in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let path = dir.path().join(filename);
+        aube_lockfile::npm::write(&path, &graph, &manifest).unwrap();
+        let output: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            output["packages"]["node_modules/empty-key"]["bin"],
+            serde_json::json!({"b": "b.js", "empty-key": "x.js"})
+        );
+    }
+    let path = dir.path().join("bun.lock");
+    aube_lockfile::bun::write(&path, &graph, &manifest).unwrap();
+    let output = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        output.contains(r#""bin": { "metadata": "./cli.js" }"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#""bin": { "meta-cli": "./cli.js" }"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#""bin": { "b": "./b.js", "empty-key": "./x.js" }"#),
+        "{output}"
+    );
+    let reread = aube_lockfile::bun::parse(&path).unwrap();
+    assert_eq!(
+        reread.packages["@fixture/metadata@1.0.0"].bin["metadata"],
+        "./cli.js"
+    );
+    assert_eq!(
+        reread.packages["object-bin@1.0.0"].bin["meta-cli"],
+        "./cli.js"
+    );
 }
