@@ -609,6 +609,20 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
                 }
                 _ => None,
             });
+            if let Some(bundled) = pkg_info.and_then(|p| p.bundled_dependencies.as_ref()) {
+                local_pkg.bundled_dependencies = bundled
+                    .names(&local_pkg.dependencies)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                local_pkg.extra_meta.insert(
+                    crate::EXTRA_PNPM_BUNDLED_DEPENDENCIES.to_string(),
+                    serde_json::to_value(bundled).map_err(|e| Error::parse(path, e.to_string()))?,
+                );
+            }
+            if let Some(version) = pkg_info.and_then(|p| p.version.as_ref()) {
+                local_pkg.version = version.clone();
+            }
             if let Some(pkg_info) = pkg_info
                 && let Some(ref res) = pkg_info.resolution
                 && let Some(mut ls) = local_source_from_resolution(res)
@@ -616,7 +630,10 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
                 if let Some(importer_path) = local_importers.get(&local_pkg.dep_path) {
                     ls = rebase_importer_local(ls, importer_path);
                 }
-                if matches!(ls, LocalSource::Git(_) | LocalSource::RemoteTarball(_)) {
+                if matches!(
+                    ls,
+                    LocalSource::Git(_) | LocalSource::RemoteTarball(_) | LocalSource::Tarball(_)
+                ) {
                     local_pkg.integrity = res.integrity.clone();
                 }
                 if let LocalSource::Git(ref mut g) = ls
@@ -750,26 +767,16 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             .and_then(|p| p.resolution.as_ref())
             .is_some_and(|r| r.git_hosted);
 
-        // pnpm writes `version: <semver>` alongside non-registry entries
-        // whose dep-path key is a URL. Prefer that over the URL itself
-        // when the dep-path version isn't a real semver — the install
-        // path uses `pkg.version` for the store-content cross-check,
-        // and comparing a URL to the tarball's declared `2.4.1` would
-        // fail every github override'd package.
-        //
-        // Gated on `tarball_url.is_some()` so the swap only applies to
-        // the remote-tarball case (where the URL is recoverable from
-        // `resolution.tarball` at write time). `git+`/`git://` /
-        // `.git#sha` transitive entries resolve through
-        // `resolution: {type: git, commit, repo}` and keep the URL as
-        // their version so install can fetch the git source.
+        // Tarball keys identify the source, while `version` records the
+        // manifest semver used for store-content validation and rewriting.
         let version_is_http_url = version.starts_with("http://") || version.starts_with("https://");
         let dep_path_git_commit = git_commit_from_dep_path_version(&version).map(str::to_string);
-        let version = if version_is_http_url && tarball_url.is_some() {
-            pkg_info.and_then(|p| p.version.clone()).unwrap_or(version)
-        } else {
-            version
-        };
+        let version =
+            if version_is_http_url && tarball_url.is_some() || version.starts_with("file:") {
+                pkg_info.and_then(|p| p.version.clone()).unwrap_or(version)
+            } else {
+                version
+            };
 
         let snapshot = raw.snapshots.get(&dep_path);
         let mut optional_dependencies = snapshot
@@ -785,8 +792,7 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             &reserved_package_keys,
         );
         dependencies.extend(optional_dependencies.clone());
-        // pnpm records `bundledDependencies` on the package entry; older
-        // aube lockfiles wrote it on the snapshot instead.
+        // Legacy aube lockfiles wrote bundles on the snapshot.
         let bundled_dependencies = pkg_info
             .and_then(|p| p.bundled_dependencies.as_ref())
             .map(|bundled| {
@@ -830,6 +836,12 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             .and_then(|p| p.deprecated.clone())
             .map(|msg| BTreeMap::from([("deprecated".to_string(), serde_json::Value::String(msg))]))
             .unwrap_or_default();
+        if let Some(bundled) = pkg_info.and_then(|p| p.bundled_dependencies.as_ref()) {
+            extra_meta.insert(
+                crate::EXTRA_PNPM_BUNDLED_DEPENDENCIES.to_string(),
+                serde_json::to_value(bundled).map_err(|e| Error::parse(path, e.to_string()))?,
+            );
+        }
         if tarball_url
             .as_deref()
             .is_some_and(tarball_url_needs_preserve)
@@ -899,6 +911,14 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             ));
         }
 
+        // Match direct file packages and fresh resolution without rewriting
+        // the file: edges the resolver needs when it reuses this lockfile.
+        let dep_path = match local_source.as_ref() {
+            Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) => {
+                local.dep_path(&name)
+            }
+            _ => dep_path,
+        };
         packages.insert(
             dep_path.clone(),
             LockedPackage {
@@ -1059,6 +1079,7 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
             auto_install_peers: s.auto_install_peers.unwrap_or(true),
             exclude_links_from_lockfile: s.exclude_links_from_lockfile.unwrap_or(false),
             lockfile_include_tarball_url: s.lockfile_include_tarball_url.unwrap_or(false),
+            extra: s.extra,
         })
         .unwrap_or_default();
 
@@ -1127,7 +1148,12 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         importers,
         packages,
         settings,
-        overrides: raw.overrides.unwrap_or_default(),
+        pnpm_override_order: raw
+            .overrides
+            .as_ref()
+            .map(|o| o.order.clone())
+            .unwrap_or_default(),
+        overrides: raw.overrides.map(|o| o.values).unwrap_or_default(),
         package_extensions_checksum: raw.package_extensions_checksum,
         pnpmfile_checksum: raw.pnpmfile_checksum,
         ignored_optional_dependencies: raw

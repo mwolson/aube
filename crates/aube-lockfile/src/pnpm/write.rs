@@ -770,10 +770,19 @@ pub fn write_with_project_root(
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
                 has_bin: !pkg.bin.is_empty(),
+                bundled_dependencies: native_pnpm_aliases
+                    .then(|| {
+                        pkg.extra_meta
+                            .get(crate::EXTRA_PNPM_BUNDLED_DEPENDENCIES)
+                            .cloned()
+                            .or_else(|| {
+                                (!pkg.bundled_dependencies.is_empty())
+                                    .then(|| serde_json::json!(pkg.bundled_dependencies))
+                            })
+                    })
+                    .flatten(),
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_meta,
-                bundled_dependencies: (native_pnpm_aliases && !pkg.bundled_dependencies.is_empty())
-                    .then(|| pkg.bundled_dependencies.clone()),
                 alias_of: (!native_pnpm_aliases)
                     .then(|| pkg.alias_of.clone())
                     .flatten(),
@@ -844,9 +853,9 @@ pub fn write_with_project_root(
                 libc: Vec::new(),
                 deprecated: None,
                 has_bin: pin.has_bin,
+                bundled_dependencies: None,
                 peer_dependencies: None,
                 peer_dependencies_meta: None,
-                bundled_dependencies: None,
                 alias_of: None,
             },
         );
@@ -984,23 +993,27 @@ pub fn write_with_project_root(
 
     let lockfile = WritablePnpmLockfile {
         lockfile_version: "9.0".to_string(),
-        settings: WritableSettings {
-            auto_install_peers: graph.settings.auto_install_peers,
-            exclude_links_from_lockfile: graph.settings.exclude_links_from_lockfile,
-            lockfile_include_tarball_url: graph.settings.lockfile_include_tarball_url,
-            extra: if native_pnpm_aliases {
-                existing_unmodeled_settings(path)
-            } else {
-                BTreeMap::new()
-            },
-        },
+        settings: settings_for_write(graph, native_pnpm_aliases, path),
         catalogs,
         // Skipped at serialization time when empty so the YAML stays
         // byte-identical to a no-overrides install.
         overrides: if graph.overrides.is_empty() {
             None
         } else {
-            Some(graph.overrides.clone())
+            let mut ordered = serde_json::Map::new();
+            if native_pnpm_aliases {
+                for key in &graph.pnpm_override_order {
+                    if let Some(value) = graph.overrides.get(key) {
+                        ordered.insert(key.clone(), serde_json::Value::String(value.clone()));
+                    }
+                }
+            }
+            for (key, value) in &graph.overrides {
+                ordered
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::Value::String(value.clone()));
+            }
+            Some(ordered)
         },
         // Already `sha256-`-prefixed (or `None`) on the graph; emitted
         // verbatim. pnpm omits these when absent, and `skip_serializing_if`
@@ -1033,6 +1046,14 @@ pub fn write_with_project_root(
         Some(environment) => environment + &yaml,
         None => yaml,
     };
+    if native_pnpm_aliases {
+        let orphans = pnpm_orphans_for_locked_addition(path, &lockfile, &yaml);
+        if !orphans.is_empty() {
+            let mut complete = graph.clone();
+            complete.packages.extend(orphans);
+            return write_with_project_root(path, &project_root, &complete, manifest);
+        }
+    }
     // Atomic via tempfile + persist. Crash, Ctrl+C, or AV
     // quarantine during the write used to leave the user with a
     // truncated pnpm-lock.yaml on disk, next install failed to
@@ -1120,7 +1141,7 @@ fn pruned_time_entries(
 #[serde(rename_all = "camelCase")]
 struct WritablePnpmLockfile {
     lockfile_version: String,
-    settings: WritableSettings,
+    settings: serde_json::Map<String, serde_json::Value>,
     /// pnpm v9 emits a top-level `catalogs:` map immediately after
     /// `settings:` and before `overrides:` — see pnpm's
     /// `sortLockfileKeys` ROOT_KEYS order (lockfileVersion, settings,
@@ -1136,7 +1157,7 @@ struct WritablePnpmLockfile {
     // serialize through yaml_serde and want byte-for-byte parity with
     // pnpm output (the field is skipped when empty).
     #[serde(skip_serializing_if = "Option::is_none")]
-    overrides: Option<BTreeMap<String, String>>,
+    overrides: Option<serde_json::Map<String, serde_json::Value>>,
     /// pnpm v9's top-level `packageExtensionsChecksum:` — emitted right
     /// after `overrides:` and before `pnpmfileChecksum:` when the
     /// effective config declares any `packageExtensions`. Already
@@ -1176,34 +1197,133 @@ struct WritablePnpmLockfile {
     snapshots: BTreeMap<String, WritableSnapshot>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct WritableSettings {
-    auto_install_peers: bool,
-    exclude_links_from_lockfile: bool,
-    /// Skipped at serialization time when false so pnpm-parity
-    /// projects that don't opt into the tarball-URL recording keep
-    /// byte-identical lockfiles.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    lockfile_include_tarball_url: bool,
-    /// Settings aube doesn't model (pnpm's `peersSuffixMaxLength`, …),
-    /// written back verbatim into pnpm-lock.yaml.
-    #[serde(flatten)]
-    extra: BTreeMap<String, serde_json::Value>,
-}
-
-/// `settings:` entries of the lockfile being replaced that aube doesn't
-/// model. pnpm compares them on a frozen install, so dropping them on a
-/// rewrite makes pnpm reject the file.
-fn existing_unmodeled_settings(path: &Path) -> BTreeMap<String, serde_json::Value> {
+fn pnpm_orphans_for_locked_addition(
+    path: &Path,
+    current: &WritablePnpmLockfile,
+    written: &str,
+) -> BTreeMap<String, crate::LockedPackage> {
+    use super::raw::parse_raw_lockfile;
     let Ok(content) = crate::read_lockfile(path) else {
         return BTreeMap::new();
     };
-    super::raw::parse_raw_lockfile(&content)
-        .ok()
-        .and_then(|raw| raw.settings)
-        .map(|settings| settings.extra)
-        .unwrap_or_default()
+    // Repeated writes of an unchanged graph need no YAML parsing.
+    if content == written {
+        return BTreeMap::new();
+    }
+    let Ok(prior_raw) = parse_raw_lockfile(&content) else {
+        return BTreeMap::new();
+    };
+    let mut prior_count = 0;
+    let mut current_count = 0;
+    for importer in current.importers.values() {
+        current_count += importer.dependencies.as_ref().map_or(0, BTreeMap::len)
+            + importer.dev_dependencies.as_ref().map_or(0, BTreeMap::len)
+            + importer
+                .optional_dependencies
+                .as_ref()
+                .map_or(0, BTreeMap::len);
+    }
+    for (path, importer) in &prior_raw.importers {
+        let current_importer = current.importers.get(path);
+        for (prior_deps, current_deps) in [
+            (
+                &importer.dependencies,
+                current_importer.and_then(|i| i.dependencies.as_ref()),
+            ),
+            (
+                &importer.dev_dependencies,
+                current_importer.and_then(|i| i.dev_dependencies.as_ref()),
+            ),
+            (
+                &importer.optional_dependencies,
+                current_importer.and_then(|i| i.optional_dependencies.as_ref()),
+            ),
+        ] {
+            for (name, dep) in prior_deps.iter().flatten() {
+                prior_count += 1;
+                if current_deps
+                    .and_then(|deps| deps.get(name))
+                    .map(|d| &d.specifier)
+                    != Some(&dep.specifier)
+                {
+                    return BTreeMap::new();
+                }
+            }
+        }
+    }
+    // Compare final pnpm keys: the in-memory graph can still contain local
+    // paths and aliases that the writer translates to pnpm's representation.
+    if current_count <= prior_count
+        || current
+            .packages
+            .keys()
+            .any(|key| !prior_raw.packages.contains_key(key))
+    {
+        return BTreeMap::new();
+    }
+    let Ok(prior) = super::parse(path) else {
+        return BTreeMap::new();
+    };
+    let reachable = prior.filter_deps(|_| true);
+    let package_key = |pkg: &crate::LockedPackage| {
+        pkg.local_source.as_ref().map_or_else(
+            || pkg.canonical_dep_path(),
+            |source| format!("{}@{}", pkg.name, source.specifier()),
+        )
+    };
+    if reachable
+        .packages
+        .values()
+        .filter(|pkg| prior_raw.packages.contains_key(&package_key(pkg)))
+        .any(|pkg| !current.packages.contains_key(&package_key(pkg)))
+    {
+        return BTreeMap::new();
+    }
+    prior
+        .packages
+        .iter()
+        .filter(|(key, pkg)| {
+            !reachable.packages.contains_key(*key)
+                && prior_raw.packages.contains_key(&package_key(pkg))
+                && !current.packages.contains_key(&package_key(pkg))
+        })
+        .map(|(key, pkg)| (key.clone(), pkg.clone()))
+        .collect()
+}
+
+fn settings_for_write(
+    graph: &LockfileGraph,
+    native_pnpm: bool,
+    path: &Path,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut settings = if native_pnpm {
+        crate::read_lockfile(path)
+            .ok()
+            .and_then(|content| super::raw::parse_raw_lockfile(&content).ok())
+            .and_then(|raw| raw.settings)
+            .map(|settings| settings.extra)
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
+    if native_pnpm {
+        settings.extend(graph.settings.extra.clone());
+    }
+    settings.insert(
+        "autoInstallPeers".to_string(),
+        graph.settings.auto_install_peers.into(),
+    );
+    settings.insert(
+        "excludeLinksFromLockfile".to_string(),
+        graph.settings.exclude_links_from_lockfile.into(),
+    );
+    if graph.settings.lockfile_include_tarball_url {
+        settings.insert("lockfileIncludeTarballUrl".to_string(), true.into());
+    }
+    if settings.get("injectWorkspacePackages") == Some(&serde_json::Value::Bool(false)) {
+        settings.remove("injectWorkspacePackages");
+    }
+    settings.into_iter().collect()
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1376,7 +1496,7 @@ struct WritablePackageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_dependencies_meta: Option<BTreeMap<String, WritablePeerDepMeta>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    bundled_dependencies: Option<Vec<String>>,
+    bundled_dependencies: Option<serde_json::Value>,
     /// Real registry name for npm-alias deps. Aube-specific extension
     /// (pnpm encodes aliases in the snapshot key itself — e.g.
     /// `odd-alias@npm:is-odd@3.0.1` — but aube keys by `alias@version`

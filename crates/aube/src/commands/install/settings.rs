@@ -661,6 +661,7 @@ pub(crate) async fn stamp_pnpm_config_checksums(
     if !matches!(write_kind, aube_lockfile::LockfileKind::Pnpm) {
         return;
     }
+    stamp_pnpm_lockfile_metadata(graph, manifest, ctx);
     let package_extensions = effective_package_extensions(manifest, ctx);
     graph.package_extensions_checksum =
         aube_lockfile::pnpm::package_extensions_checksum(&package_extensions);
@@ -702,6 +703,62 @@ pub(crate) async fn stamp_pnpm_config_checksums(
         },
         None => None,
     };
+}
+
+fn stamp_pnpm_lockfile_metadata(
+    graph: &mut aube_lockfile::LockfileGraph,
+    manifest: &aube_manifest::PackageJson,
+    ctx: &aube_settings::ResolveCtx<'_>,
+) {
+    let max_length = resolve_peers_suffix_max_length(ctx);
+    graph.settings.extra.remove("peersSuffixMaxLength");
+    if max_length != 1000 {
+        graph
+            .settings
+            .extra
+            .insert("peersSuffixMaxLength".to_string(), max_length.into());
+    }
+    graph.settings.extra.remove("dedupePeers");
+    if resolve_dedupe_peers(ctx) {
+        graph
+            .settings
+            .extra
+            .insert("dedupePeers".to_string(), true.into());
+    }
+    let mut order = Vec::new();
+    for namespace in ["pnpm", "aube"] {
+        if let Some(overrides) = manifest
+            .extra
+            .get(namespace)
+            .and_then(|ns| ns.get("overrides"))
+            .and_then(serde_json::Value::as_object)
+        {
+            order.extend(overrides.keys().cloned());
+        }
+    }
+    if let Some(overrides) = manifest
+        .extra
+        .get("overrides")
+        .and_then(serde_json::Value::as_object)
+    {
+        order.extend(overrides.keys().cloned());
+    }
+    if let Some(overrides) = ctx
+        .workspace_yaml
+        .get("overrides")
+        .and_then(yaml_serde::Value::as_mapping)
+    {
+        order.extend(
+            overrides
+                .keys()
+                .filter_map(yaml_serde::Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if !order.is_empty() {
+        order.extend(std::mem::take(&mut graph.pnpm_override_order));
+        graph.pnpm_override_order = order;
+    }
 }
 
 /// Finalize a freshly resolved graph for the lockfile write paths that
@@ -1848,5 +1905,38 @@ mod finalize_lockfile_graph_tests {
             ignored.pnpmfile_checksum.is_none(),
             "--ignore-pnpmfile must not record a pnpmfile checksum"
         );
+    }
+}
+
+#[cfg(test)]
+mod pnpm_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn records_current_peer_settings_and_override_declaration_order() {
+        let workspace = yaml_serde::from_str(
+            "peersSuffixMaxLength: 80\ndedupePeers: true\noverrides:\n  z: '1'\n  a: '2'\n",
+        )
+        .unwrap();
+        let ctx = aube_settings::ResolveCtx::files_only(&[], &workspace);
+        let mut graph = aube_lockfile::LockfileGraph::default();
+        graph
+            .settings
+            .extra
+            .insert("addMissingPeerTypes".to_string(), true.into());
+        stamp_pnpm_lockfile_metadata(&mut graph, &aube_manifest::PackageJson::default(), &ctx);
+        assert_eq!(
+            graph.settings.extra["peersSuffixMaxLength"],
+            serde_json::json!(80)
+        );
+        assert_eq!(graph.settings.extra["dedupePeers"], true);
+        assert_eq!(graph.settings.extra["addMissingPeerTypes"], true);
+        assert_eq!(graph.pnpm_override_order, ["z", "a"]);
+        let workspace = BTreeMap::new();
+        let ctx = aube_settings::ResolveCtx::files_only(&[], &workspace);
+        stamp_pnpm_lockfile_metadata(&mut graph, &aube_manifest::PackageJson::default(), &ctx);
+        assert!(!graph.settings.extra.contains_key("peersSuffixMaxLength"));
+        assert!(!graph.settings.extra.contains_key("dedupePeers"));
+        assert_eq!(graph.settings.extra["addMissingPeerTypes"], true);
     }
 }

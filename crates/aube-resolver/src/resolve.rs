@@ -139,9 +139,11 @@ impl Resolver {
         }
 
         let canonical = LockfileGraph {
+            pnpm_override_order: Vec::new(),
             importers,
             packages: resolved,
             settings: aube_lockfile::LockfileSettings {
+                extra: BTreeMap::new(),
                 auto_install_peers: self.auto_install_peers,
                 exclude_links_from_lockfile: self.exclude_links_from_lockfile,
                 // Tarball-URL recording is a lockfile-writer concern; the

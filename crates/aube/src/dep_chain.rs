@@ -115,13 +115,15 @@ impl ChainIndex {
                 chains.entry(real_key).or_insert_with(|| ancestors.clone());
             }
 
-            // Enqueue children. `dependencies` holds the dep_path
-            // tail (`<version>(<peer-context>)?`); the full child
-            // dep_path is `<child-name>@<tail>`.
             let mut child_ancestors = ancestors;
             child_ancestors.push((pkg.name.clone(), pkg.version.clone()));
-            push_children(&mut queue, &pkg.dependencies, &child_ancestors);
-            push_children(&mut queue, &pkg.optional_dependencies, &child_ancestors);
+            push_children(&mut queue, &pkg.dependencies, &child_ancestors, graph);
+            push_children(
+                &mut queue,
+                &pkg.optional_dependencies,
+                &child_ancestors,
+                graph,
+            );
         }
 
         Self { chains }
@@ -132,10 +134,14 @@ fn push_children(
     queue: &mut VecDeque<(String, Vec<(String, String)>)>,
     children: &BTreeMap<String, String>,
     ancestors: &[(String, String)],
+    graph: &LockfileGraph,
 ) {
     for (child_name, child_tail) in children {
-        let child_dep_path = format!("{child_name}@{child_tail}");
-        queue.push_back((child_dep_path, ancestors.to_vec()));
+        if let Some(child) = aube_lockfile::resolve_dep_edge(child_name, child_tail, |key| {
+            graph.packages.contains_key(key)
+        }) {
+            queue.push_back((child, ancestors.to_vec()));
+        }
     }
 }
 
