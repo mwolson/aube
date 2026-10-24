@@ -555,7 +555,7 @@ pub(crate) fn build_resolver(
     // every platform, while formats without that metadata stay host-only.
     let target_lockfile_kind = Some(lockfile_kind_for_write_with_ctx(cwd, &ctx)?);
     let dependency_policy = install::resolve_dependency_policy(manifest, &ctx)?;
-    Ok(install::configure_resolver(
+    install::configure_resolver(
         aube_resolver::Resolver::new(std::sync::Arc::new(make_client(cwd))),
         cwd,
         manifest,
@@ -577,7 +577,7 @@ pub(crate) fn build_resolver(
             ignore_scripts: false,
         },
         None,
-    ))
+    )
 }
 
 /// Resolve [`aube_registry::config::FetchPolicy`] from the same
