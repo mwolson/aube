@@ -393,9 +393,7 @@ pub fn write(
             }
             let install_path = format!(
                 "{}/{}",
-                aube_util::path::normalize_lexical(dir)
-                    .to_string_lossy()
-                    .replace('\\', "/"),
+                directory_target(project_dir, dir),
                 super::segments_to_install_path(&segments)
             );
             if placed.insert(install_path, child_key.clone()).is_none() {
