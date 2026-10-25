@@ -746,9 +746,8 @@ pub fn write_with_project_root(
     Ok(())
 }
 
-// Bun folder identifiers are root-relative even when the declared spec is
-// absolute. A path outside the project stays absolute: the reader takes a
-// climbing path under a workspace-scoped key as importer-relative.
+// Bun directory identifiers are root-relative, including external sources
+// beneath workspace-scoped package keys.
 fn bun_directory_path(project_dir: &Path, dir: &Path) -> String {
     let relative = dir
         .is_absolute()
@@ -757,8 +756,7 @@ fn bun_directory_path(project_dir: &Path, dir: &Path) -> String {
                 std::path::absolute(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
             pathdiff::diff_paths(dir, aube_util::path::normalize_lexical(&project_dir))
         })
-        .flatten()
-        .filter(|relative| !relative.starts_with(".."));
+        .flatten();
     bun_local_path(relative.as_deref().unwrap_or(dir))
 }
 
