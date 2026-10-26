@@ -873,6 +873,55 @@ pub fn write_with_project_root(
             entry.remove("peer");
         }
     }
+    let npm_version = npm_version(manifest);
+    let non_install = existing
+        .as_ref()
+        .map(super::raw::non_install_entries)
+        .unwrap_or_default();
+    let packages = value["packages"]
+        .as_object_mut()
+        .expect("serialized packages is an object");
+    // npm loads old locations as possible fsParents even when they leave the graph.
+    let package_locations: BTreeSet<_> = existing
+        .as_ref()
+        .and_then(|document| document["packages"].as_object())
+        .into_iter()
+        .flat_map(|packages| packages.iter())
+        .chain(packages.iter())
+        .filter(|(path, entry)| !path.is_empty() && entry["link"] != true)
+        .map(|(path, _)| path.clone())
+        .collect();
+    let live_parents: BTreeSet<_> = packages
+        .keys()
+        .filter(|path| !retained_paths.contains(*path))
+        .flat_map(|path| {
+            path.match_indices('/')
+                .map(|(index, _)| path[..index].to_owned())
+        })
+        .collect();
+    for (path, mut entry) in non_install {
+        if entry["extraneous"] != true
+            && !live_parents.contains(&path)
+            && let Some(fields) = entry.as_object_mut()
+        {
+            fields.insert("extraneous".into(), true.into());
+            for flag in ["dev", "devOptional", "optional", "peer"] {
+                fields.remove(flag);
+            }
+        }
+        if entry["extraneous"] == true
+            && npm_version.as_ref().is_some_and(|version| {
+                version >= &node_semver::Version::new(11, 15, 0)
+                    && (version < &node_semver::Version::new(11, 17, 0)
+                        || !path
+                            .match_indices('/')
+                            .any(|(index, _)| package_locations.contains(&path[..index])))
+            })
+        {
+            continue;
+        }
+        packages.entry(path).or_insert(entry);
+    }
     sort_keys_like_npm(&mut value);
     let mut body =
         serde_json::to_string_pretty(&value).map_err(|e| Error::parse(path, e.to_string()))?;
@@ -1012,6 +1061,10 @@ fn writes_libc(
     {
         return true;
     }
+    npm_version(manifest).is_some_and(|version| version >= node_semver::Version::new(11, 11, 0))
+}
+
+fn npm_version(manifest: &aube_manifest::PackageJson) -> Option<node_semver::Version> {
     manifest
         .extra
         .get("packageManager")
@@ -1023,7 +1076,6 @@ fn writes_libc(
             // Only a plain semver pin selects a convention, even though the parser is loose.
             (parsed.to_string() == version.split('+').next()?).then_some(parsed)
         })
-        .is_some_and(|version| version >= node_semver::Version::new(11, 11, 0))
 }
 
 fn npm_libc(
