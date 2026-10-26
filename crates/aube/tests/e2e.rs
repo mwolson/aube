@@ -83,6 +83,120 @@ fn e2e_lock() -> MutexGuard<'static, ()> {
 }
 
 #[test]
+fn npm_workspace_membership_changes_reject_frozen_and_repair_normal_installs() {
+    let _guard = e2e_lock();
+    for lockfile in ["package-lock.json", "npm-shrinkwrap.json"] {
+        for change in ["add", "rename", "move", "remove"] {
+            for warm in [false, true] {
+                let sbx = Sandbox::new();
+                sbx.write_manifest(r#"{"name":"root","private":true,"workspaces":["a"]}"#);
+                fs::create_dir(sbx.project.join("a")).unwrap();
+                fs::write(
+                    sbx.project.join("a/package.json"),
+                    r#"{"name":"a","version":"1.0.0"}"#,
+                )
+                .unwrap();
+                fs::write(
+                    sbx.project.join(lockfile),
+                    r#"{
+                    "name":"root","lockfileVersion":3,"requires":true,
+                    "packages":{"":{"name":"root","workspaces":["a"]},
+                    "a":{"version":"1.0.0"},"node_modules/a":{"resolved":"a","link":true}}
+                }"#,
+                )
+                .unwrap();
+                if warm {
+                    sbx.cmd()
+                        .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+                        .assert()
+                        .success();
+                }
+                match change {
+                    "add" => {
+                        sbx.write_manifest(
+                            r#"{"name":"root","private":true,"workspaces":["a","b"]}"#,
+                        );
+                        fs::create_dir(sbx.project.join("b")).unwrap();
+                        fs::write(
+                            sbx.project.join("b/package.json"),
+                            r#"{"name":"b","version":"1.0.0"}"#,
+                        )
+                        .unwrap();
+                    }
+                    "rename" => {
+                        fs::write(
+                            sbx.project.join("a/package.json"),
+                            r#"{"name":"renamed","version":"1.0.0"}"#,
+                        )
+                        .unwrap();
+                    }
+                    "move" => {
+                        fs::rename(sbx.project.join("a"), sbx.project.join("b")).unwrap();
+                        sbx.write_manifest(r#"{"name":"root","private":true,"workspaces":["b"]}"#);
+                    }
+                    "remove" => {
+                        fs::remove_dir_all(sbx.project.join("a")).unwrap();
+                        sbx.write_manifest(r#"{"name":"root","private":true,"workspaces":[]}"#);
+                    }
+                    _ => unreachable!(),
+                }
+                let stale = fs::read(sbx.project.join(lockfile)).unwrap();
+                sbx.cmd()
+                    .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+                    .assert()
+                    .failure()
+                    .stderr(wrapped_contains("lockfile is out of date"));
+                assert_eq!(fs::read(sbx.project.join(lockfile)).unwrap(), stale);
+                sbx.cmd()
+                    .args(["install", "--prefer-frozen-lockfile", "--ignore-scripts"])
+                    .assert()
+                    .success();
+                let lock: serde_json::Value =
+                    serde_json::from_slice(&fs::read(sbx.project.join(lockfile)).unwrap()).unwrap();
+                let packages = &lock["packages"];
+                match change {
+                    "add" => {
+                        assert_eq!(packages["a"], serde_json::json!({"version":"1.0.0"}));
+                        assert_eq!(packages["b"], serde_json::json!({"version":"1.0.0"}));
+                        assert_eq!(
+                            packages["node_modules/b"],
+                            serde_json::json!({"resolved":"b","link":true})
+                        );
+                    }
+                    "rename" => {
+                        assert!(packages.get("node_modules/a").is_none());
+                        assert_eq!(
+                            packages["a"],
+                            serde_json::json!({"name":"renamed","version":"1.0.0"})
+                        );
+                        assert_eq!(
+                            packages["node_modules/renamed"],
+                            serde_json::json!({"resolved":"a","link":true})
+                        );
+                    }
+                    "move" => {
+                        assert_eq!(
+                            packages["b"],
+                            serde_json::json!({"name":"a","version":"1.0.0"})
+                        );
+                        assert_eq!(
+                            packages["node_modules/a"],
+                            serde_json::json!({"resolved":"b","link":true})
+                        );
+                    }
+                    "remove" => assert!(packages.get("node_modules/a").is_none()),
+                    _ => unreachable!(),
+                }
+                sbx.cmd()
+                    .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+                    .assert()
+                    .success();
+            }
+        }
+    }
+}
+
+#[test]
 fn version_flag_reports_binary_version() {
     let _guard = e2e_lock();
     let sbx = Sandbox::new();

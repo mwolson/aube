@@ -66,7 +66,8 @@ pub(crate) fn discover_workspace_plan(
     // it still prunes orphan importer entries on the all-packages-
     // gone boundary, where `manifests` collapses to `[(".", root)]`
     // and looks indistinguishable from a non-workspace install.
-    let is_workspace_project = !ignore_workspace && aube_workspace::is_workspace_project_root(cwd);
+    let is_workspace_project = !ignore_workspace
+        && (root_manifest.workspaces.is_some() || aube_workspace::is_workspace_project_root(cwd));
     let link_all_workspace_importers =
         has_workspace && (recursive_install || !workspace_filter.is_empty());
 
