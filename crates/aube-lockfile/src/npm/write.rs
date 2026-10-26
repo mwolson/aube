@@ -873,6 +873,21 @@ pub fn write_with_project_root(
             entry.remove("peer");
         }
     }
+    // npm 11.15+ drops only flagged extraneous entries outside node_modules.
+    let drops_extraneous = npm_version(manifest)
+        .is_some_and(|version| version >= node_semver::Version::new(11, 15, 0));
+    let non_install = existing
+        .as_ref()
+        .map(super::raw::non_install_entries)
+        .unwrap_or_default();
+    let packages = value["packages"]
+        .as_object_mut()
+        .expect("serialized packages is an object");
+    for (path, entry) in non_install {
+        if !drops_extraneous || entry["extraneous"] != true {
+            packages.entry(path).or_insert(entry);
+        }
+    }
     sort_keys_like_npm(&mut value);
     let mut body =
         serde_json::to_string_pretty(&value).map_err(|e| Error::parse(path, e.to_string()))?;
@@ -1012,6 +1027,10 @@ fn writes_libc(
     {
         return true;
     }
+    npm_version(manifest).is_some_and(|version| version >= node_semver::Version::new(11, 11, 0))
+}
+
+fn npm_version(manifest: &aube_manifest::PackageJson) -> Option<node_semver::Version> {
     manifest
         .extra
         .get("packageManager")
@@ -1023,7 +1042,6 @@ fn writes_libc(
             // Only a plain semver pin selects a convention, even though the parser is loose.
             (parsed.to_string() == version.split('+').next()?).then_some(parsed)
         })
-        .is_some_and(|version| version >= node_semver::Version::new(11, 11, 0))
 }
 
 fn npm_libc(
