@@ -6,7 +6,7 @@ use super::raw::{HAS_INSTALL_SCRIPT_KEY, InstallPathInfo, RawNpmLockfile, RawNpm
 /// Parse a package-lock.json or npm-shrinkwrap.json file into a LockfileGraph.
 pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
-    let document: serde_json::Value = crate::parse_json(path, content)?;
+    let mut document: serde_json::Value = crate::parse_json(path, content)?;
     let raw = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
         .map_err(|e| Error::parse(path, e.to_string()))?;
 
@@ -25,6 +25,13 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         packages: BTreeMap::new(),
         ..Default::default()
     };
+    let non_install = super::raw::non_install_entries(&document);
+    if !non_install.is_empty() {
+        // Reachability and per-placement metadata must also ignore stale declarations.
+        if let Some(packages) = document["packages"].as_object_mut() {
+            packages.retain(|path, _| !non_install.contains_key(path));
+        }
+    }
 
     // npm does not tag remote-tarball package entries separately from
     // registry packages: both use an HTTP(S) `resolved` URL. The declared
@@ -33,8 +40,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // being sent through packument validation.
     let remote_tarball_specs: BTreeSet<&str> = raw
         .packages
-        .values()
-        .flat_map(|entry| {
+        .iter()
+        .filter(|(path, _)| !non_install.contains_key(*path))
+        .flat_map(|(_, entry)| {
             entry
                 .dependencies
                 .values()
@@ -55,8 +63,9 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     // package from it.
     let link_targets: BTreeSet<String> = raw
         .packages
-        .values()
-        .filter_map(|entry| entry.link.then(|| entry.resolved.clone()).flatten())
+        .iter()
+        .filter(|(path, _)| !non_install.contains_key(*path))
+        .filter_map(|(_, entry)| entry.link.then(|| entry.resolved.clone()).flatten())
         .collect();
 
     // Map each install_path to the locked dep_path it resolves to. We need
@@ -65,7 +74,7 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let mut install_path_info: BTreeMap<String, InstallPathInfo> = BTreeMap::new();
 
     for (install_path, entry) in &raw.packages {
-        if install_path.is_empty() || entry.in_bundle {
+        if install_path.is_empty() || entry.in_bundle || non_install.contains_key(install_path) {
             continue;
         }
         if link_targets.contains(install_path) {
