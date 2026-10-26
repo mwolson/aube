@@ -2930,6 +2930,266 @@ fn test_write_npm_workspace_member_versionless_and_optional_peers_round_trip() {
     assert!(json["packages"]["packages/b"].get("version").is_none());
 }
 
+#[test]
+fn new_workspace_members_match_npm_name_and_platform_metadata() {
+    for (importer, name, expected_name) in [
+        ("packages/plain", Some("plain"), None),
+        ("packages/folder", Some("different"), Some("different")),
+        (
+            "packages/scoped",
+            Some("@scope/scoped"),
+            Some("@scope/scoped"),
+        ),
+        ("packages/@scope/scoped", Some("@scope/scoped"), None),
+        (
+            "packages/@other/scoped",
+            Some("@scope/scoped"),
+            Some("@scope/scoped"),
+        ),
+        ("packages/unnamed", None, None),
+        ("packages/@s/x", None, None),
+    ] {
+        for npm in ["npm@11.6.2", "npm@11.20.0"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join(importer);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut member = serde_json::json!({
+                "version": "1.0.0", "os": ["linux", "darwin"],
+                "cpu": ["x64", "arm64"], "libc": ["glibc"]
+            });
+            if let Some(name) = name {
+                member["name"] = name.into();
+            }
+            std::fs::write(dir.join("package.json"), member.to_string()).unwrap();
+            let mut graph = LockfileGraph::default();
+            graph.importers.insert(".".into(), Vec::new());
+            graph.importers.insert(importer.into(), Vec::new());
+            let manifest = serde_json::from_value(serde_json::json!({
+                "name": "root", "packageManager": npm
+            }))
+            .unwrap();
+            let path = tmp.path().join("package-lock.json");
+            write(&path, &graph, &manifest).unwrap();
+            let lock: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let entry = &lock["packages"][importer];
+            assert_eq!(
+                entry.get("name").and_then(serde_json::Value::as_str),
+                expected_name
+            );
+            assert_eq!(entry["os"], member["os"]);
+            assert_eq!(entry["cpu"], member["cpu"]);
+            assert_eq!(
+                entry.get("libc"),
+                (npm == "npm@11.20.0").then_some(&member["libc"])
+            );
+            let link_name = name.unwrap_or(if importer == "packages/@s/x" {
+                "@s/x"
+            } else {
+                "unnamed"
+            });
+            assert_eq!(
+                lock["packages"][format!("node_modules/{link_name}")],
+                serde_json::json!({"resolved": importer, "link": true})
+            );
+        }
+    }
+}
+
+#[test]
+fn nameless_workspace_members_with_relative_paths_keep_entries_and_links() {
+    const CHILD_IMPORTER: &str = "AUBE_TEST_NAMELESS_MEMBER_IMPORTER";
+    const CHILD_NAME: &str = "AUBE_TEST_NAMELESS_MEMBER_NAME";
+    let Ok(importer) = std::env::var(CHILD_IMPORTER) else {
+        for (root_path, importer, name) in [
+            ("root", "../shared", "shared"),
+            ("root", "x", "x"),
+            ("@org/root", "../shared", "@org/shared"),
+            ("@proj", "x", "@proj/x"),
+            ("root", "../@s/y", "@s/y"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join(root_path);
+            std::fs::create_dir_all(root.join(importer)).unwrap();
+            std::fs::write(
+                root.join(importer).join("package.json"),
+                r#"{"version":"1.0.0"}"#,
+            )
+            .unwrap();
+            // A subprocess isolates cwd changes from the other unit tests.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!(
+                        "{}::nameless_workspace_members_with_relative_paths_keep_entries_and_links",
+                        module_path!().split_once("::").unwrap().1
+                    ),
+                    "--nocapture",
+                ])
+                .env(CHILD_IMPORTER, importer)
+                .env(CHILD_NAME, name)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(String::from_utf8_lossy(&result.stdout).contains("1 passed"));
+        }
+        return;
+    };
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(".".into(), Vec::new());
+    graph.importers.insert(importer.clone(), Vec::new());
+    let manifest = serde_json::from_value(serde_json::json!({
+        "name": "root", "workspaces": [importer], "packageManager": "npm@11.6.2"
+    }))
+    .unwrap();
+    let path = Path::new("package-lock.json");
+    write(path, &graph, &manifest).unwrap();
+    let lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let name = std::env::var(CHILD_NAME).unwrap();
+    assert_eq!(
+        lock["packages"][&importer],
+        serde_json::json!({"version": "1.0.0"})
+    );
+    assert_eq!(
+        lock["packages"][format!("node_modules/{name}")],
+        serde_json::json!({"resolved": importer, "link": true})
+    );
+    assert!(parse(path).is_ok());
+}
+
+#[test]
+fn skipped_workspace_members_do_not_create_null_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("package-lock.json");
+    let mut graph = LockfileGraph::default();
+    graph.importers.insert(".".into(), Vec::new());
+    graph.importers.insert("missing".into(), Vec::new());
+    write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+    let lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(lock["packages"].get("missing").is_none());
+    assert!(parse(&path).is_ok());
+}
+
+#[test]
+fn existing_workspace_member_platform_metadata_survives_unreadable_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("package-lock.json");
+    let entry = serde_json::json!({
+        "name": "old", "version": "1.0.0", "os": ["linux"],
+        "cpu": ["x64"], "libc": ["glibc"]
+    });
+    let old = serde_json::json!({"lockfileVersion": 3, "requires": true,
+        "packages": {"": {"name": "root", "workspaces": ["old"]},
+            "old": entry, "node_modules/old": {"resolved": "old", "link": true}}});
+    let manifest = serde_json::from_value(serde_json::json!({
+        "name": "root", "workspaces": ["old"], "packageManager": "npm@11.6.2"
+    }))
+    .unwrap();
+    for contents in [None, Some("invalid json")] {
+        std::fs::write(&path, old.to_string()).unwrap();
+        if let Some(contents) = contents {
+            std::fs::create_dir_all(tmp.path().join("old")).unwrap();
+            std::fs::write(tmp.path().join("old/package.json"), contents).unwrap();
+        }
+        let graph = parse(&path).unwrap();
+        write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(lock["packages"]["old"], entry);
+    }
+}
+
+#[test]
+fn existing_workspace_member_metadata_survives_new_member_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("package-lock.json");
+    for entry in [
+        serde_json::json!({"version": "1.0.0"}),
+        serde_json::json!({"name": "old", "version": "1.0.0", "os": ["linux"], "cpu": ["x64"], "libc": ["glibc"]}),
+    ] {
+        let old = serde_json::json!({"lockfileVersion": 3, "requires": true,
+            "packages": {"": {"name": "root", "workspaces": ["old"]},
+                "old": entry, "node_modules/old": {"resolved": "old", "link": true}}});
+        std::fs::write(&path, old.to_string()).unwrap();
+        for member in ["old", "new"] {
+            let dir = tmp.path().join(member);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut manifest = serde_json::json!({"name": member, "version": "1.0.0"});
+            for key in ["os", "cpu", "libc"] {
+                if let Some(value) = entry.get(key) {
+                    manifest[key] = value.clone();
+                }
+            }
+            std::fs::write(dir.join("package.json"), manifest.to_string()).unwrap();
+        }
+        let mut graph = parse(&path).unwrap();
+        graph.importers.insert("new".into(), Vec::new());
+        let manifest = serde_json::from_value(serde_json::json!({"name": "root", "workspaces": ["old", "new"], "packageManager": "npm@11.6.2"})).unwrap();
+        write(&path, &graph, &manifest).unwrap();
+        let lock: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(lock["packages"]["old"], entry);
+        assert_eq!(
+            lock["packages"]["new"].get("libc").is_some(),
+            entry.get("libc").is_some()
+        );
+    }
+}
+
+#[test]
+fn existing_workspace_member_platform_metadata_tracks_current_manifest() {
+    for old_libc in [false, true] {
+        for remove_platforms in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("package-lock.json");
+            let mut entry = serde_json::json!({
+                "name": "old", "version": "1.0.0", "os": ["linux"], "cpu": ["x64"]
+            });
+            if old_libc {
+                entry["libc"] = serde_json::json!(["glibc"]);
+            }
+            let old = serde_json::json!({"lockfileVersion": 3, "requires": true,
+                "packages": {"": {"name": "root", "workspaces": ["old"]},
+                    "old": entry, "node_modules/old": {"resolved": "old", "link": true}}});
+            std::fs::write(&path, old.to_string()).unwrap();
+            let dir = tmp.path().join("old");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut member = serde_json::json!({"name": "old", "version": "1.0.0"});
+            if !remove_platforms {
+                member["os"] = serde_json::json!(["linux", "darwin"]);
+                member["cpu"] = serde_json::json!(["x64", "arm64"]);
+                member["libc"] = serde_json::json!(["musl"]);
+            }
+            std::fs::write(dir.join("package.json"), member.to_string()).unwrap();
+            let graph = parse(&path).unwrap();
+            let manifest = serde_json::from_value(serde_json::json!({
+                "name": "root", "workspaces": ["old"], "packageManager": "npm@11.6.2"
+            }))
+            .unwrap();
+            write(&path, &graph, &manifest).unwrap();
+            let lock: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let written = &lock["packages"]["old"];
+            assert_eq!(written.get("name"), entry.get("name"));
+            for key in ["os", "cpu"] {
+                assert_eq!(written.get(key), member.get(key));
+            }
+            assert_eq!(
+                written.get("libc"),
+                old_libc.then(|| member.get("libc")).flatten()
+            );
+        }
+    }
+}
+
 /// npm copies an object-form `workspaces` field as declared: an absent
 /// `nohoist` stays absent and a declared one is kept.
 #[test]

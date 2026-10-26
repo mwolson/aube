@@ -100,6 +100,7 @@ impl LockfileGraph {
             workspace_catalogs,
             is_workspace_install,
             true,
+            false,
         )
     }
 
@@ -120,6 +121,7 @@ impl LockfileGraph {
             workspace_catalogs,
             is_workspace_install,
             kind_records_resolution_metadata(kind),
+            matches!(kind, LockfileKind::Npm | LockfileKind::NpmShrinkwrap),
         )
     }
 
@@ -147,6 +149,7 @@ impl LockfileGraph {
             workspace_catalogs,
             is_workspace_install,
             kind_records_resolution_metadata(kind),
+            matches!(kind, LockfileKind::Npm | LockfileKind::NpmShrinkwrap),
         )
     }
 
@@ -185,6 +188,7 @@ impl LockfileGraph {
         workspace_catalogs: &BTreeMap<String, BTreeMap<String, String>>,
         is_workspace_install: bool,
         check_resolution_metadata: bool,
+        npm_importers: bool,
     ) -> DriftStatus {
         // Override drift is checked once at the workspace level, against
         // the root manifest. Workspace-package manifests may declare
@@ -218,18 +222,36 @@ impl LockfileGraph {
             .filter_map(|(_, manifest)| manifest.name.as_deref())
             .collect();
         for (importer_path, manifest) in manifests.iter().chain(local_targets) {
-            // pnpm-format lockfiles record every workspace project that
-            // declares deps. A missing importer means the lockfile was
-            // written without that project (the per-importer check below
-            // treats an absent entry as "no specifiers" and says fresh).
-            if check_resolution_metadata
-                && is_workspace_install
+            // npm records even dependency-free members so it can recreate
+            // their root links. pnpm only needs importers that declare deps.
+            if is_workspace_install
                 && !self.importers.contains_key(importer_path)
-                && manifest_declares_deps(manifest, self.settings.auto_install_peers)
+                && (npm_importers
+                    || (check_resolution_metadata
+                        && manifest_declares_deps(manifest, self.settings.auto_install_peers)))
             {
                 return DriftStatus::Stale {
                     reason: format!(
                         "workspace importer {importer_path} is missing from the lockfile"
+                    ),
+                };
+            }
+            if npm_importers
+                && is_workspace_install
+                && importer_path != "."
+                && manifests.iter().any(|(path, _)| path == importer_path)
+                && let Some(name) = manifest.name.as_deref()
+                && !self.importers.get(".").into_iter().flatten().any(|dep| {
+                    dep.name == name
+                        && self.packages.get(&dep.dep_path).is_some_and(|pkg| {
+                            matches!(&pkg.local_source, Some(LocalSource::Link(path))
+                                if path == std::path::Path::new(importer_path))
+                        })
+                })
+            {
+                return DriftStatus::Stale {
+                    reason: format!(
+                        "workspace importer {importer_path} is missing its {name} link"
                     ),
                 };
             }

@@ -151,7 +151,10 @@ pub fn write_with_project_root(
     // Key packages by `name@version` (ignore peer-context suffix) so
     // lookups from parent deps resolve to one canonical entry even if
     // the graph has several contextualized variants.
-    let write_libc = writes_libc(path, manifest);
+    let existing: Option<serde_json::Value> = crate::read_lockfile(path)
+        .ok()
+        .and_then(|content| crate::parse_json(path, content).ok());
+    let write_libc = writes_libc(existing.as_ref(), manifest);
     let mut canonical = crate::build_canonical_map(graph);
     for pkg in graph.packages.values().filter(|pkg| {
         matches!(
@@ -241,6 +244,18 @@ pub fn write_with_project_root(
         })
         .collect();
 
+    // The parent of a bare `package-lock.json` path is empty and means cwd.
+    let absolute_project_dir = std::path::absolute(project_dir.join("."))
+        .map_err(|e| Error::Io(project_dir.to_path_buf(), e))?;
+    let member_folder_names: BTreeMap<_, _> = member_manifests
+        .iter()
+        .filter(|(_, member)| member.name.is_none())
+        .filter_map(|(importer, _)| {
+            let member_dir =
+                aube_util::path::normalize_lexical(&absolute_project_dir.join(importer));
+            npm_name_from_folder(&member_dir).map(|name| (*importer, name))
+        })
+        .collect();
     for (importer_path, importer_roots) in graph.importers.iter().filter(|(path, _)| *path != ".") {
         let (name, version, peer_dependencies, peer_dependencies_meta, declared) =
             if let Some(pkg) = workspace_package_for_importer(graph, importer_path) {
@@ -263,10 +278,9 @@ pub fn write_with_project_root(
             } else if let Some(manifest) = member_manifests.get(importer_path.as_str()) {
                 // npm links a nameless member under its folder name.
                 let Some(name) = manifest.name.as_deref().or_else(|| {
-                    importer_path
-                        .rsplit('/')
-                        .next()
-                        .filter(|segment| !segment.is_empty() && *segment != "..")
+                    member_folder_names
+                        .get(importer_path.as_str())
+                        .map(String::as_str)
                 }) else {
                     continue;
                 };
@@ -709,6 +723,53 @@ pub fn write_with_project_root(
             value["packages"][importer]["engines"] = engines.clone();
         }
     }
+    for importer in graph.importers.keys().filter(|path| *path != ".") {
+        let Some(entry) = value["packages"]
+            .get_mut(importer)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let old_entry = existing
+            .as_ref()
+            .and_then(|doc| doc["packages"].get(importer));
+        let member = member_manifests.get(importer.as_str());
+        // Preserve existing names; derive new names with Arborist's folder rule.
+        let same_identity = old_entry.is_some()
+            && existing.as_ref().is_some_and(|doc| {
+                let link = &doc["packages"]
+                    [format!("node_modules/{}", entry["name"].as_str().unwrap_or(""))];
+                link["link"] == true && link["resolved"].as_str() == Some(importer)
+            });
+        if same_identity {
+            if let Some(value) = old_entry.and_then(|old| old.get("name")) {
+                entry.insert("name".into(), value.clone());
+            } else {
+                entry.remove("name");
+            }
+        } else {
+            let source = project_dir.join(importer);
+            let source = source.canonicalize().unwrap_or(source);
+            if member.is_some_and(|manifest| manifest.name.is_none())
+                || entry.get("name").and_then(serde_json::Value::as_str)
+                    == npm_name_from_folder(&source).as_deref()
+            {
+                entry.remove("name");
+            }
+        }
+        for key in ["os", "cpu", "libc"] {
+            let value = member.map_or_else(
+                || old_entry.and_then(|old| old.get(key)),
+                |member| member.extra.get(key),
+            );
+            if (key != "libc" || write_libc)
+                && let Some(value) = value
+                && npm_meta_value(value)
+            {
+                entry.insert(key.into(), value.clone());
+            }
+        }
+    }
     for (install_path, canonical_key) in &placed {
         if let Some(entries) = canonical
             .get(canonical_key)
@@ -924,14 +985,28 @@ fn locale_compare_en(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
+fn npm_name_from_folder(path: &Path) -> Option<String> {
+    let base = path.file_name()?.to_str()?;
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|p| p.to_str());
+    Some(
+        if let Some(parent) = parent.filter(|parent| parent.starts_with('@')) {
+            format!("{parent}/{base}")
+        } else {
+            base.to_string()
+        },
+    )
+}
+
 // npm 11.11+ writes libc; older npm strips it. Prefer the lockfile's
 // existing convention, then the project's npm pin, to avoid rewrite churn.
-fn writes_libc(path: &Path, manifest: &aube_manifest::PackageJson) -> bool {
-    let document = crate::read_lockfile(path)
-        .ok()
-        .and_then(|content| crate::parse_json::<serde_json::Value>(path, content).ok());
+fn writes_libc(
+    document: Option<&serde_json::Value>,
+    manifest: &aube_manifest::PackageJson,
+) -> bool {
     if document
-        .as_ref()
         .and_then(|doc| doc["packages"].as_object())
         .is_some_and(|packages| packages.values().any(|entry| entry.get("libc").is_some()))
     {
@@ -1403,14 +1478,12 @@ mod tests {
             suffix in "(-rc\\.(0|[1-9][0-9]{0,2}))?(\\+[a-z0-9]{1,8})?",
             prefix in proptest::sample::select(vec!["v", "V", "v ", "V\t", " ", "\t"]),
         ) {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("package-lock.json");
             let version = format!("{major}.{minor}.{patch}{suffix}");
             let mut manifest = aube_manifest::PackageJson::default();
             manifest.extra.insert("packageManager".into(), format!("npm@{version}").into());
-            proptest::prop_assert!(super::writes_libc(&path, &manifest));
+            proptest::prop_assert!(super::writes_libc(None, &manifest));
             manifest.extra.insert("packageManager".into(), format!("npm@{prefix}{version}").into());
-            proptest::prop_assert!(!super::writes_libc(&path, &manifest));
+            proptest::prop_assert!(!super::writes_libc(None, &manifest));
         }
     }
 }
