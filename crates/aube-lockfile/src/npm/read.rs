@@ -6,8 +6,8 @@ use super::raw::{HAS_INSTALL_SCRIPT_KEY, InstallPathInfo, RawNpmLockfile, RawNpm
 /// Parse a package-lock.json or npm-shrinkwrap.json file into a LockfileGraph.
 pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
     let content = crate::read_lockfile(path)?;
-    let document: serde_json::Value = crate::parse_json(path, content)?;
-    let raw = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
+    let mut document: serde_json::Value = crate::parse_json(path, content)?;
+    let mut raw = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
         .map_err(|e| Error::parse(path, e.to_string()))?;
 
     if raw.lockfile_version < 2 {
@@ -25,6 +25,16 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
         packages: BTreeMap::new(),
         ..Default::default()
     };
+
+    let non_install = super::raw::non_install_entries(&document);
+    if !non_install.is_empty() {
+        // Reachability and per-placement metadata must also ignore stale declarations.
+        if let Some(packages) = document["packages"].as_object_mut() {
+            packages.retain(|path, _| !non_install.contains_key(path));
+        }
+        raw.packages
+            .retain(|path, _| !non_install.contains_key(path));
+    }
 
     // npm does not tag remote-tarball package entries separately from
     // registry packages: both use an HTTP(S) `resolved` URL. The declared
