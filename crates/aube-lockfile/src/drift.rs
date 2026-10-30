@@ -121,7 +121,7 @@ impl LockfileGraph {
             workspace_catalogs,
             is_workspace_install,
             kind_records_resolution_metadata(kind),
-            kind == LockfileKind::Npm,
+            matches!(kind, LockfileKind::Npm | LockfileKind::NpmShrinkwrap),
         )
     }
 
@@ -149,7 +149,7 @@ impl LockfileGraph {
             workspace_catalogs,
             is_workspace_install,
             kind_records_resolution_metadata(kind),
-            kind == LockfileKind::Npm,
+            matches!(kind, LockfileKind::Npm | LockfileKind::NpmShrinkwrap),
         )
     }
 
@@ -237,6 +237,25 @@ impl LockfileGraph {
                 return DriftStatus::Stale {
                     reason: format!(
                         "workspace importer {importer_path} is missing from the lockfile"
+                    ),
+                };
+            }
+            if records_every_member
+                && is_workspace_install
+                && importer_path != "."
+                && manifests.iter().any(|(path, _)| path == importer_path)
+                && let Some(name) = manifest.name.as_deref()
+                && !self.importers.get(".").into_iter().flatten().any(|dep| {
+                    dep.name == name
+                        && self.packages.get(&dep.dep_path).is_some_and(|pkg| {
+                            matches!(&pkg.local_source, Some(LocalSource::Link(path))
+                                if path == std::path::Path::new(importer_path))
+                        })
+                })
+            {
+                return DriftStatus::Stale {
+                    reason: format!(
+                        "workspace importer {importer_path} is missing its {name} link"
                     ),
                 };
             }
