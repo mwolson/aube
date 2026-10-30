@@ -53,15 +53,15 @@ struct WriteNpmPackage<'a> {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     peer_dependencies_meta: BTreeMap<&'a str, WriteNpmPeerDepMeta>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    bin: BTreeMap<&'a str, &'a str>,
+    bin: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     engines: BTreeMap<&'a str, &'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     os: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    libc: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    libc: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     deprecated: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -649,12 +649,7 @@ pub fn write_with_project_root(
                     optional_dependencies: optional_deps,
                     peer_dependencies: peer_deps,
                     peer_dependencies_meta: peer_deps_meta,
-                    bin: pkg
-                        .bin
-                        .iter()
-                        .filter(|(k, _)| !k.is_empty())
-                        .map(|(k, v)| (k.as_str(), v.as_str()))
-                        .collect(),
+                    bin: normalize_bin(pkg.alias_of.as_deref().unwrap_or(&pkg.name), &pkg.bin),
                     engines: pkg
                         .engines
                         .iter()
@@ -664,7 +659,7 @@ pub fn write_with_project_root(
                     license: pkg.license.as_deref(),
                     os: pkg.os.to_vec(),
                     cpu: pkg.cpu.to_vec(),
-                    libc: libc_for(pkg),
+                    libc: npm_libc(pkg, install_path, libc_for(pkg)),
                     deprecated: deprecated(pkg),
                     funding: npm_funding(pkg),
                     dev,
@@ -691,12 +686,7 @@ pub fn write_with_project_root(
                 optional_dependencies: optional_deps,
                 peer_dependencies: peer_deps,
                 peer_dependencies_meta: peer_deps_meta,
-                bin: pkg
-                    .bin
-                    .iter()
-                    .filter(|(k, _)| !k.is_empty())
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect(),
+                bin: normalize_bin(pkg.alias_of.as_deref().unwrap_or(&pkg.name), &pkg.bin),
                 engines: pkg
                     .engines
                     .iter()
@@ -704,7 +694,7 @@ pub fn write_with_project_root(
                     .collect(),
                 os: pkg.os.to_vec(),
                 cpu: pkg.cpu.to_vec(),
-                libc: libc_for(pkg),
+                libc: npm_libc(pkg, install_path, libc_for(pkg)),
                 deprecated: deprecated(pkg),
                 funding: npm_funding(pkg),
                 dev,
@@ -950,6 +940,24 @@ fn locale_compare_en(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
+fn npm_libc(
+    pkg: &LockedPackage,
+    install_path: &str,
+    fallback: Vec<String>,
+) -> Option<serde_json::Value> {
+    if let Some(metadata) = pkg
+        .extra_meta
+        .get(super::raw::ENTRY_METADATA_KEY)
+        .and_then(|entries| entries.get(install_path))
+    {
+        return metadata
+            .get("libc")
+            .filter(|value| !value.is_null())
+            .cloned();
+    }
+    (!fallback.is_empty()).then(|| serde_json::json!(fallback))
+}
+
 /// Keep npm's existing placements when their resolved identities still exist.
 fn preferred_placements(
     path: &Path,
@@ -1003,8 +1011,12 @@ impl PriorLibc {
             write_new: false,
         };
         if let Ok(content) = crate::read_lockfile(path)
-            && let Ok(raw) = crate::parse_json::<RawNpmLockfile>(path, content)
+            && let Ok(document) = crate::parse_json::<serde_json::Value>(path, content)
+            && let Ok(raw) = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
         {
+            prior.write_new = document["packages"]
+                .as_object()
+                .is_some_and(|packages| packages.values().any(|entry| entry.get("libc").is_some()));
             for (install_path, entry) in raw.packages {
                 let Some(version) = entry.version else {
                     continue;
@@ -1023,7 +1035,7 @@ impl PriorLibc {
                 prior.known.insert(key);
             }
         }
-        prior.write_new = !prior.with_libc.is_empty() || npm_writes_libc(manifest);
+        prior.write_new |= npm_writes_libc(manifest);
         prior
     }
 
@@ -1052,14 +1064,12 @@ fn npm_writes_libc(manifest: &aube_manifest::PackageJson) -> bool {
     let Some(version) = pin.strip_prefix("npm@") else {
         return false;
     };
-    let version = version.split('+').next().unwrap_or(version);
-    let (Ok(version), Ok(floor)) = (
-        node_semver::Version::parse(version),
-        node_semver::Version::parse("11.11.0"),
-    ) else {
+    let Ok(mut parsed) = node_semver::Version::parse(version) else {
         return false;
     };
-    version >= floor
+    parsed.build.clear();
+    parsed.to_string() == version.split('+').next().unwrap_or(version)
+        && parsed >= node_semver::Version::new(11, 11, 0)
 }
 
 fn directory_target(project_dir: &Path, dir: &Path) -> String {
@@ -1078,10 +1088,11 @@ fn directory_target(project_dir: &Path, dir: &Path) -> String {
 }
 
 /// The `funding` value to write: the verbatim value read from an existing
-/// package-lock.json wins, since a freshly resolved entry only knows the URL.
+/// package-lock.json or full registry manifest wins over the URL-only fallback.
 fn npm_funding(pkg: &LockedPackage) -> Option<serde_json::Value> {
     pkg.extra_meta
         .get(crate::EXTRA_NPM_FUNDING)
+        .filter(|value| npm_meta_value(value))
         .cloned()
         .or_else(|| {
             pkg.funding_url
@@ -1090,8 +1101,6 @@ fn npm_funding(pkg: &LockedPackage) -> Option<serde_json::Value> {
         })
 }
 
-/// A project manifest's `funding`, verbatim, skipped the way npm's
-/// `metaFieldFromPkg` skips it: falsy values and empty objects or arrays.
 /// A manifest's `os` or `cpu`, which may be a string or an array.
 fn manifest_platform(manifest: &aube_manifest::PackageJson, key: &str) -> Vec<String> {
     match manifest.extra.get(key) {
@@ -1105,18 +1114,10 @@ fn manifest_platform(manifest: &aube_manifest::PackageJson, key: &str) -> Vec<St
 }
 
 fn manifest_funding(manifest: &aube_manifest::PackageJson) -> Option<serde_json::Value> {
-    use serde_json::Value;
     manifest
         .extra
         .get("funding")
-        .filter(|value| match value {
-            Value::Null | Value::Bool(false) => false,
-            Value::String(s) => !s.is_empty(),
-            Value::Number(n) => n.as_f64() != Some(0.0),
-            Value::Array(items) => !items.is_empty(),
-            Value::Object(map) => !map.is_empty(),
-            Value::Bool(true) => true,
-        })
+        .filter(|value| npm_meta_value(value))
         .cloned()
 }
 
@@ -1125,6 +1126,18 @@ fn deprecated(pkg: &LockedPackage) -> Option<&str> {
         .get("deprecated")
         .and_then(serde_json::Value::as_str)
         .filter(|message| !message.is_empty())
+}
+
+fn npm_meta_value(value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Number(n) => n.as_f64() != Some(0.0),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(true) => true,
+    }
 }
 
 fn has_install_script(pkg: &LockedPackage) -> bool {
@@ -1417,4 +1430,62 @@ fn bundled_entries(
             (path.clone(), entry)
         })
         .collect()
+}
+
+/// Match npm-normalize-package-bin independently of the host path syntax.
+fn normalize_bin(name: &str, bin: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    bin.iter()
+        .filter_map(|(command, target)| {
+            let command = if command.is_empty() { name } else { command };
+            let command = command.replace(['\\', ':'], "/");
+            let command = command
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            let command = normalize_bin_path(command);
+            let target = normalize_bin_path(&target.replace('\\', "/"));
+            (!command.is_empty() && command != "__proto__" && !target.is_empty())
+                .then_some((command, target))
+        })
+        .collect()
+}
+
+fn normalize_bin_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let mut result = parts.join("/");
+    if !result.is_empty() && path.ends_with('/') {
+        result.push('/');
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    proptest::proptest! {
+        #[test]
+        fn npm_libc_policy_requires_a_plain_semver_pin(
+            major in 12u16..100,
+            minor in 0u16..100,
+            patch in 0u16..100,
+            suffix in "(-rc\\.(0|[1-9][0-9]{0,2}))?(\\+[a-z0-9]{1,8})?",
+            prefix in proptest::sample::select(vec!["v", "V", "v ", "V\t", " ", "\t"]),
+        ) {
+            let version = format!("{major}.{minor}.{patch}{suffix}");
+            let mut manifest = aube_manifest::PackageJson::default();
+            manifest.extra.insert("packageManager".into(), format!("npm@{version}").into());
+            proptest::prop_assert!(super::npm_writes_libc(&manifest));
+            manifest.extra.insert("packageManager".into(), format!("npm@{prefix}{version}").into());
+            proptest::prop_assert!(!super::npm_writes_libc(&manifest));
+        }
+    }
 }

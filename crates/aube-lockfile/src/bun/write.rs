@@ -441,6 +441,11 @@ pub fn write_with_project_root(
                 || k == crate::EXTRA_YARN_RESOLVED
                 || k == crate::EXTRA_DECLARED_DEPENDENCIES_KNOWN
                 || k == crate::EXTRA_PNPM_BUNDLED_DEPENDENCIES
+                || k == crate::npm::BUNDLED_ENTRIES_KEY
+                || k == crate::npm::BUNDLED_OPTIONAL_KEY
+                || k == crate::npm::ENTRY_METADATA_KEY
+                || k == crate::npm::RETAINED_ENTRIES_KEY
+                || k == crate::npm::WORKSPACES_KEY
                 || k == crate::EXTRA_NPM_FUNDING
                 || k == crate::EXTRA_YARN_BERRY_PRESERVED_BLOCKS
                 || k == crate::EXTRA_YARN_BERRY_CONDITIONS

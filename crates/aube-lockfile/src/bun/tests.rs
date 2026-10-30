@@ -3086,3 +3086,43 @@ fn write_keeps_path_scope_off_a_member_named_like_it() {
         "react@18.0.0"
     );
 }
+
+#[test]
+fn test_write_omits_npm_internal_entry_metadata() {
+    let mut graph = LockfileGraph::default();
+    let mut pkg = LockedPackage {
+        name: "foo".into(),
+        version: "1.0.0".into(),
+        dep_path: "foo@1.0.0".into(),
+        ..Default::default()
+    };
+    for key in [
+        crate::npm::BUNDLED_ENTRIES_KEY,
+        crate::npm::BUNDLED_OPTIONAL_KEY,
+        crate::npm::ENTRY_METADATA_KEY,
+        crate::npm::RETAINED_ENTRIES_KEY,
+        crate::npm::WORKSPACES_KEY,
+    ] {
+        pkg.extra_meta
+            .insert(key.into(), serde_json::json!({"npm": true}));
+    }
+    pkg.extra_meta
+        .insert("hasInstallScript".into(), true.into());
+    graph.packages.insert(pkg.dep_path.clone(), pkg);
+    graph.importers.insert(
+        ".".into(),
+        vec![DirectDep {
+            name: "foo".into(),
+            dep_path: "foo@1.0.0".into(),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".into()),
+        }],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bun.lock");
+    write(&path, &graph, &aube_manifest::PackageJson::default()).unwrap();
+    assert_eq!(
+        written_packages(&path)["foo"][2],
+        serde_json::json!({"hasInstallScript": true})
+    );
+}

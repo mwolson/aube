@@ -649,9 +649,16 @@ pub fn parse(path: &Path) -> Result<LockfileGraph, Error> {
             .extra_meta
             .entry(super::raw::ENTRY_METADATA_KEY.into())
             .or_insert_with(|| serde_json::json!({}));
+        let entry = &raw.packages[install_path];
+        let source_path = entry
+            .resolved
+            .as_deref()
+            .filter(|_| entry.link)
+            .unwrap_or(install_path);
         metadata[install_path] = serde_json::json!({
             "peer": raw.packages[install_path].peer,
             "nonPeer": ordinary.contains(install_path),
+            "libc": document["packages"][source_path].get("libc"),
         });
         if let Some(workspaces) = document["packages"][install_path].get("workspaces") {
             pkg.extra_meta

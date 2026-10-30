@@ -100,13 +100,13 @@ pub(super) struct RawNpmPackage {
 
 pub const BUNDLED_OPTIONAL_KEY: &str = "__aube_npm_bundled_optional";
 
-pub(super) const BUNDLED_ENTRIES_KEY: &str = "__aube_npm_bundled_entries";
+pub(crate) const BUNDLED_ENTRIES_KEY: &str = "__aube_npm_bundled_entries";
 
-pub(super) const RETAINED_ENTRIES_KEY: &str = "__aube_npm_retained_entries";
+pub(crate) const RETAINED_ENTRIES_KEY: &str = "__aube_npm_retained_entries";
 
-pub(super) const ENTRY_METADATA_KEY: &str = "__aube_npm_entry_metadata";
+pub(crate) const ENTRY_METADATA_KEY: &str = "__aube_npm_entry_metadata";
 
-pub(super) const WORKSPACES_KEY: &str = "__aube_npm_workspaces";
+pub(crate) const WORKSPACES_KEY: &str = "__aube_npm_workspaces";
 
 /// `LockedPackage::extra_meta` key carrying npm's `hasInstallScript: true`
 /// so a parse/write cycle keeps it.
