@@ -321,9 +321,9 @@ impl LocalSource {
 ///
 /// Mirror `pnpm::read::push_direct`'s keying so the resolved value lands
 /// on the exact `dep_path` the package was materialized under. Returns
-/// `None` for every other value (plain semver, `file:`, `link:`, npm
-/// aliases, …) so callers keep the verbatim `name@value` key those
-/// already resolve correctly with.
+/// `None` for other values, including `file:` and `link:`. Graph walkers
+/// should use [`resolve_dep_edge`] to resolve those values against the
+/// package map as well.
 pub fn shared_local_dep_path(dep_name: &str, dep_value: &str) -> Option<String> {
     // pnpm appends a `(peer@ver)` suffix to some spec values; the parser
     // strips it before classifying the source, so strip it here too.
@@ -361,7 +361,7 @@ pub fn shared_local_dep_path(dep_name: &str, dep_value: &str) -> Option<String> 
 /// package key?" predicate), or `None` when the edge points outside the
 /// graph (a pruned optional, an unresolved peer, a `link:` target, …).
 ///
-/// Three conventions coexist because the readers disagree on what a
+/// These conventions coexist because the readers disagree on what a
 /// dependency *value* holds, and a graph walker that only knows one of
 /// them silently drops the others:
 ///   1. `tail` verbatim — npm/yarn/bun store the full dep_path as the
@@ -375,6 +375,8 @@ pub fn shared_local_dep_path(dep_name: &str, dep_value: &str) -> Option<String> 
 ///      marking walkers that skip it prune the entire git/tarball subtree
 ///      (a content-pinned git/tarball child and everything under it
 ///      vanishes from the walk once the node is keyed canonically).
+///   4. `file:` edges likewise target path-hashed directory/tarball keys.
+///      Preserve the specifier in the graph for resolver reuse.
 pub fn resolve_dep_edge(name: &str, tail: &str, contains: impl Fn(&str) -> bool) -> Option<String> {
     if contains(tail) {
         return Some(tail.to_string());
@@ -382,6 +384,18 @@ pub fn resolve_dep_edge(name: &str, tail: &str, contains: impl Fn(&str) -> bool)
     let rejoined = format!("{name}@{tail}");
     if contains(&rejoined) {
         return Some(rejoined);
+    }
+    if let Some(path) = tail.split('(').next().and_then(|s| s.strip_prefix("file:")) {
+        let key = LocalSource::Directory(path.into()).dep_path(name);
+        if let Some(index) = tail.find('(') {
+            let contextual = format!("{key}{}", &tail[index..]);
+            if contains(&contextual) {
+                return Some(contextual);
+            }
+        }
+        if contains(&key) {
+            return Some(key);
+        }
     }
     shared_local_dep_path(name, tail).filter(|key| contains(key))
 }

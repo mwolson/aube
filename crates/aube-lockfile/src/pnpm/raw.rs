@@ -164,7 +164,7 @@ pub(super) fn project_lockfile_score(raw: &RawPnpmLockfile) -> u64 {
     if raw.catalogs.as_ref().is_some_and(|c| !c.is_empty()) {
         score += 100;
     }
-    if raw.overrides.as_ref().is_some_and(|o| !o.is_empty()) {
+    if raw.overrides.as_ref().is_some_and(|o| !o.values.is_empty()) {
         score += 100;
     }
     score += raw.packages.len() as u64;
@@ -181,7 +181,7 @@ pub(super) struct RawPnpmLockfile {
     #[serde(default)]
     pub(super) settings: Option<RawSettings>,
     #[serde(default)]
-    pub(super) overrides: Option<BTreeMap<String, String>>,
+    pub(super) overrides: Option<OrderedOverrides>,
     /// `sha256-` prefixed `object-hash` of the effective
     /// `packageExtensions`. Round-tripped verbatim so a parse/write
     /// cycle preserves the value pnpm wrote and drift detection can
@@ -476,4 +476,36 @@ pub(super) struct RawSnapshot {
     pub(super) optional: Option<bool>,
     #[serde(default)]
     pub(super) transitive_peer_dependencies: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct OrderedOverrides {
+    pub(super) values: BTreeMap<String, String>,
+    pub(super) order: Vec<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for OrderedOverrides {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = OrderedOverrides;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an overrides map")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut result = OrderedOverrides::default();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if !result.values.contains_key(&key) {
+                        result.order.push(key.clone());
+                    }
+                    result.values.insert(key, value);
+                }
+                Ok(result)
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
 }
