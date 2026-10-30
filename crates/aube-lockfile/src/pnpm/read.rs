@@ -915,7 +915,8 @@ pub fn parse_with_options(path: &Path, options: ParseOptions) -> Result<Lockfile
         // the file: edges the resolver needs when it reuses this lockfile.
         let dep_path = match local_source.as_ref() {
             Some(local @ (LocalSource::Directory(_) | LocalSource::Tarball(_))) => {
-                local.dep_path(&name)
+                let suffix = dep_path.find('(').map_or("", |offset| &dep_path[offset..]);
+                format!("{}{suffix}", local.dep_path(&name))
             }
             _ => dep_path,
         };
