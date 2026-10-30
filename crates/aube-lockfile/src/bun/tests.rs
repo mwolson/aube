@@ -2839,7 +2839,7 @@ fn test_write_keeps_a_nested_packages_same_name_dep_one_level_below() {
 }
 
 #[test]
-fn test_write_absolute_directory_idents_relative_to_lockfile_inside_project() {
+fn test_write_absolute_directory_idents_relative_to_lockfile() {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -2897,14 +2897,7 @@ fn test_write_absolute_directory_idents_relative_to_lockfile_inside_project() {
             let lock = project.join("bun.lock");
             write(&lock, &graph, &manifest).unwrap();
             let packages = written_packages(&lock);
-            let expected = if target.starts_with("..") {
-                temp.path()
-                    .join("child")
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            } else {
-                target.to_string()
-            };
+            let expected = target.to_string();
             assert_eq!(packages["child"][0], format!("child@file:{expected}"));
             if !direct {
                 assert_eq!(packages["host"][1]["dependencies"]["child"], spec);
@@ -3125,4 +3118,70 @@ fn test_write_omits_npm_internal_entry_metadata() {
         written_packages(&path)["foo"][2],
         serde_json::json!({"hasInstallScript": true})
     );
+}
+
+#[test]
+fn test_write_external_workspace_directory_idents_relative_to_root() {
+    for member_name in [Some("app"), Some("@fixture/app"), None] {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let member = project.join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        let external = temp.path().join("child");
+        let spec = format!("file:{}", external.display());
+        let mut member_manifest = serde_json::json!({"dependencies": {"child": spec}});
+        if let Some(name) = member_name {
+            member_manifest["name"] = name.into();
+        }
+        std::fs::write(member.join("package.json"), member_manifest.to_string()).unwrap();
+        let local = LocalSource::Directory(external.clone());
+        let child_key = local.dep_path("child");
+        let mut graph = LockfileGraph::default();
+        for (key, version, local_source) in [
+            ("child@2.0.0".to_string(), "2.0.0", None),
+            (child_key.clone(), "1.0.0", Some(local)),
+        ] {
+            graph.packages.insert(
+                key.clone(),
+                LockedPackage {
+                    name: "child".into(),
+                    version: version.into(),
+                    dep_path: key,
+                    local_source,
+                    ..Default::default()
+                },
+            );
+        }
+        for (importer, dep_path, specifier) in [
+            (".", "child@2.0.0".to_string(), "2.0.0".to_string()),
+            ("packages/app", child_key, spec),
+        ] {
+            graph.importers.insert(
+                importer.into(),
+                vec![DirectDep {
+                    name: "child".into(),
+                    dep_path,
+                    dep_type: DepType::Production,
+                    specifier: Some(specifier),
+                }],
+            );
+        }
+        let manifest = aube_manifest::PackageJson {
+            dependencies: BTreeMap::from([("child".into(), "2.0.0".into())]),
+            ..Default::default()
+        };
+        let path = project.join("bun.lock");
+        write(&path, &graph, &manifest).unwrap();
+        let scope = member_name.unwrap_or("packages/app");
+        assert_eq!(
+            written_packages(&path)[format!("{scope}/child")][0],
+            "child@file:../child"
+        );
+        let reread = parse(&path).unwrap();
+        let dep = &reread.importers["packages/app"][0];
+        assert_eq!(
+            reread.packages[&dep.dep_path].local_source,
+            Some(LocalSource::Directory(PathBuf::from("../child")))
+        );
+    }
 }
