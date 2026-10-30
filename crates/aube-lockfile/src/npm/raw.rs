@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone)]
 pub(super) struct InstallPathInfo {
@@ -107,6 +107,36 @@ pub(crate) const RETAINED_ENTRIES_KEY: &str = "__aube_npm_retained_entries";
 pub(crate) const ENTRY_METADATA_KEY: &str = "__aube_npm_entry_metadata";
 
 pub(crate) const WORKSPACES_KEY: &str = "__aube_npm_workspaces";
+
+/// npm records workspace metadata and stale `file:` targets outside node_modules.
+/// The root and entries targeted by live links remain installed.
+pub(super) fn non_install_entries(
+    document: &serde_json::Value,
+) -> BTreeMap<String, serde_json::Value> {
+    let Some(packages) = document["packages"].as_object() else {
+        return BTreeMap::new();
+    };
+    let link_targets: BTreeSet<_> = packages
+        .iter()
+        .filter(|(path, entry)| entry["link"] == true && !is_non_install(path, entry))
+        .filter_map(|(_, entry)| entry["resolved"].as_str())
+        .collect();
+    packages
+        .iter()
+        .filter(|(path, entry)| {
+            is_non_install(path, entry) && !link_targets.contains(path.as_str())
+        })
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect()
+}
+
+fn is_non_install(path: &str, entry: &serde_json::Value) -> bool {
+    !path.is_empty()
+        && path != "node_modules"
+        && !path.starts_with("node_modules/")
+        && !path.contains("/node_modules/")
+        && (entry["link"] != true || entry["extraneous"] == true)
+}
 
 /// `LockedPackage::extra_meta` key carrying npm's `hasInstallScript: true`
 /// so a parse/write cycle keeps it.

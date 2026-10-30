@@ -4961,3 +4961,355 @@ fn npm_writer_normalizes_bin_names_and_paths() {
         }
     }
 }
+
+proptest::proptest! {
+    #[test]
+    fn npm_non_install_entries_stay_out_of_the_graph(
+        path in "(\\.\\./){0,3}(([a-z]{1,8}|node_modules)/){1,4}[a-z]{1,8}",
+        extraneous in proptest::bool::ANY,
+        name in proptest::bool::ANY,
+        dependencies in proptest::bool::ANY,
+        version in 1u8..20,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("package-lock.json");
+        let mut entry = serde_json::json!({"version": format!("{version}.0.0"), "extraneous": extraneous});
+        if name {
+            entry["name"] = serde_json::json!("b");
+        }
+        if dependencies {
+            entry["dependencies"] = serde_json::json!({"missing": "https://example.com/missing.tgz"});
+        }
+        // Unknown metadata must survive too.
+        entry["custom"] = serde_json::json!({"z": 1, "a": ["kept"]});
+        let mut original = serde_json::json!({
+            "name": "root", "lockfileVersion": 3, "requires": true,
+            "packages": {"": {"name": "root"}, path.clone(): entry}
+        });
+        super::write::sort_keys_like_npm(&mut original);
+        let bytes = format!("{}\n", serde_json::to_string_pretty(&original).unwrap());
+        std::fs::write(&source, &bytes).unwrap();
+        let excluded = !path.split('/').any(|segment| segment == "node_modules");
+        proptest::prop_assert_eq!(super::raw::non_install_entries(&original).contains_key(&path), excluded);
+        let graph = parse(&source).unwrap();
+        proptest::prop_assert_eq!(graph.packages.len(), usize::from(!excluded));
+        if !excluded {
+            return Ok(());
+        }
+        proptest::prop_assert_eq!(graph.importers.len(), 1);
+        proptest::prop_assert!(graph.importers["."].is_empty());
+        let manifest: aube_manifest::PackageJson = serde_json::from_value(serde_json::json!({"name": "root"})).unwrap();
+        write(&source, &graph, &manifest).unwrap();
+        original["packages"][&path]["extraneous"] = true.into();
+        super::write::sort_keys_like_npm(&mut original);
+        let expected = format!("{}\n", serde_json::to_string_pretty(&original).unwrap());
+        proptest::prop_assert_eq!(std::fs::read_to_string(&source).unwrap(), expected);
+        proptest::prop_assert!(parse(&source).unwrap().packages.is_empty());
+    }
+}
+
+#[test]
+fn npm_extraneous_entries_follow_the_npm_pin() {
+    for (pin, retained, nested_retained) in [
+        (None, true, true),
+        (Some("npm@10.8.2"), true, true),
+        (Some("npm@11.6.2"), true, true),
+        (Some("npm@11.14.1"), true, true),
+        (Some("npm@11.15.0"), false, false),
+        (Some("npm@11.15.0+sha512.abc"), false, false),
+        (Some("npm@11.16.0"), false, false),
+        (Some("npm@11.17.0"), false, true),
+        (Some("npm@11.20.0"), false, true),
+        (Some("npm@12.0.0"), false, true),
+        (Some("npm@11.15.0-beta.0"), true, true),
+        (Some("npm@^11.15.0"), true, true),
+        (Some("npm@latest"), true, true),
+        (Some("pnpm@12.0.0"), true, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("package-lock.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "lockfileVersion": 3,
+                "packages": {
+                    "": {},
+                    "node_modules/delisted": {"resolved": "packages/delisted", "link": true},
+                    "packages/delisted": {"version": "1.0.0"},
+                    "packages/delisted/q": {"version": "1.0.0", "extraneous": true},
+                    "packages/link": {"resolved": "../ext/link", "link": true, "extraneous": true},
+                    "packages/link/q": {"version": "1.0.0", "extraneous": true},
+                    "node_modules/live": {"resolved": "packages/live", "link": true},
+                    "packages/live": {"version": "1.0.0"},
+                    "packages/live/q": {"version": "1.0.0", "extraneous": true},
+                    "packages/parent": {"version": "1.0.0", "dev": true, "devOptional": true, "optional": true, "peer": true},
+                    "packages/b/unflagged": {"version": "1.0.0", "dev": true},
+                    "packages/liv": {"version": "1.0.0", "peer": true},
+                    "packages/parent/q": {"version": "1.0.0", "extraneous": true},
+                    "packages/b": {"version": "1.0.0", "extraneous": true},
+                    "packages/b/q": {"version": "1.0.0", "extraneous": true},
+                    "packages/bb/q": {"version": "1.0.0", "extraneous": true},
+                    "packages/x": [],
+                    "../ext/b": {"version": "1.0.0", "extraneous": true},
+                    "../ext/b/inner": {"version": "1.0.0", "extraneous": true}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut graph = parse(&file).unwrap();
+        // The old link target can be an fsParent after its member leaves the graph.
+        graph.importers.remove("packages/delisted");
+        graph
+            .importers
+            .get_mut(".")
+            .unwrap()
+            .retain(|dep| dep.name != "delisted");
+        graph.packages.retain(|_, pkg| pkg.name != "delisted");
+        let manifest = serde_json::from_value(serde_json::json!({"packageManager": pin})).unwrap();
+        write(&file, &graph, &manifest).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            written["packages"].get("packages/delisted/q").is_some(),
+            nested_retained,
+            "{pin:?}: packages/delisted/q"
+        );
+        assert_eq!(written["packages"]["packages/x"], serde_json::json!([]));
+        assert!(written["packages"].get("packages/delisted").is_none());
+        assert!(written["packages"].get("node_modules/delisted").is_none());
+        // Retained children do not keep a parent live; similar prefixes do not either.
+        for (path, keep) in [
+            ("packages/parent", retained),
+            ("packages/liv", retained),
+            ("packages/b/unflagged", nested_retained),
+        ] {
+            assert_eq!(
+                written["packages"].get(path).cloned(),
+                keep.then(|| serde_json::json!({"version": "1.0.0", "extraneous": true})),
+                "{pin:?}: {path}"
+            );
+        }
+        for path in ["packages/b", "packages/bb/q", "packages/link/q", "../ext/b"] {
+            assert_eq!(
+                written["packages"].get(path).is_some(),
+                retained,
+                "{pin:?}: {path}"
+            );
+        }
+        for path in [
+            "packages/live/q",
+            "packages/parent/q",
+            "packages/b/q",
+            "../ext/b/inner",
+        ] {
+            assert_eq!(
+                written["packages"].get(path).is_some(),
+                nested_retained,
+                "{pin:?}: {path}"
+            );
+        }
+    }
+}
+
+#[test]
+fn npm_extraneous_root_links_and_node_modules_remain_in_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("package-lock.json");
+    std::fs::write(&file, serde_json::json!({
+        "lockfileVersion": 3,
+        "packages": {
+            "": {"extraneous": true, "dependencies": {"b": "*"}},
+            "node_modules/b": {"resolved": "packages/b", "link": true},
+            "packages/b": {"version": "1.0.0", "extraneous": true, "dependencies": {"x": "1.0.0"}},
+            "packages/b/node_modules/x": {"version": "1.0.0", "extraneous": true},
+            "node_modules/unused": {"version": "2.0.0", "extraneous": true},
+            "not_node_modules/stale": {
+                "version": "1.0.0", "extraneous": true,
+                "dependencies": {"unused": "2.0.0"}
+            }
+        }
+    }).to_string()).unwrap();
+    let graph = parse(&file).unwrap();
+    assert_eq!(graph.packages.len(), 3);
+    assert!(graph.packages.contains_key("unused@2.0.0"));
+    assert_eq!(
+        graph.packages["unused@2.0.0"].extra_meta[super::raw::ENTRY_METADATA_KEY]["node_modules/unused"]
+            ["nonPeer"],
+        false
+    );
+    assert_eq!(graph.importers["."].len(), 1);
+    assert_eq!(graph.importers["packages/b"][0].name, "x");
+    let b = graph.packages.values().find(|pkg| pkg.name == "b").unwrap();
+    assert_eq!(b.dependencies["x"], "1.0.0");
+}
+
+#[test]
+fn npm_live_member_replaces_retained_extraneous_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("package-lock.json");
+    let member = dir.path().join("packages/b");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        r#"{"name":"b","version":"2.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &file,
+        serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {"": {}, "packages/b": {"version": "1.0.0", "extraneous": true}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut graph = parse(&file).unwrap();
+    graph.importers.insert("packages/b".into(), Vec::new());
+    let manifest =
+        serde_json::from_value(serde_json::json!({"workspaces": ["packages/*"]})).unwrap();
+    write(&file, &graph, &manifest).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        written["packages"]["packages/b"],
+        serde_json::json!({"version": "2.0.0"})
+    );
+    assert_eq!(written["packages"]["node_modules/b"]["link"], true);
+}
+
+#[test]
+fn npm_extraneous_entries_stay_with_the_destination_lockfile() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("package-lock.json");
+    std::fs::write(
+        &source,
+        serde_json::json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/a": {"resolved": "packages/a", "link": true},
+                "packages/a": {"version": "1.0.0"},
+                "packages/b": {"version": "1.0.0", "extraneous": true}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let graph = parse(&source).unwrap();
+    let deployed = graph.subset_to_importer("packages/a", |_| true).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let manifest = aube_manifest::PackageJson::default();
+    let destination = out.join("package-lock.json");
+    write(&destination, &deployed, &manifest).unwrap();
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&destination).unwrap()).unwrap();
+    assert!(written["packages"].get("packages/b").is_none());
+
+    // Format conversion must not carry npm metadata through the source graph either.
+    crate::write_lockfile_as(&out, &graph, &manifest, LockfileKind::Bun).unwrap();
+    let bun = std::fs::read_to_string(out.join("bun.lock")).unwrap();
+    assert!(!bun.contains("__aube_npm_"));
+}
+
+#[test]
+fn npm_extraneous_links_do_not_promote_stale_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("package-lock.json");
+    for extraneous in [false, true] {
+        let mut original = serde_json::json!({
+            "lockfileVersion": 3,
+            "requires": true,
+            "packages": {
+                "": {},
+                "packages/b": {"resolved": "../ext/b", "link": true, "extraneous": true},
+                "../ext/b": {"version": "1.0.0", "extraneous": extraneous}
+            }
+        });
+        if !extraneous {
+            original["packages"]["../ext/b"]
+                .as_object_mut()
+                .unwrap()
+                .remove("extraneous");
+        }
+        std::fs::write(&file, original.to_string()).unwrap();
+        let graph = parse(&file).unwrap();
+        assert!(graph.packages.is_empty());
+        assert_eq!(graph.importers.len(), 1);
+        write(&file, &graph, &aube_manifest::PackageJson::default()).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        original["packages"]["../ext/b"]["extraneous"] = true.into();
+        // npm drops a root entry with nothing to record.
+        original["packages"].as_object_mut().unwrap().remove("");
+        assert_eq!(written["packages"], original["packages"]);
+    }
+}
+
+#[test]
+fn npm_non_install_predicate_matches_npm_locations() {
+    for (path, excluded) in [
+        ("", false),
+        ("node_modules", false),
+        ("node_modules/b", false),
+        ("packages/b/node_modules/c", false),
+        ("packages/node_modules", true),
+        ("not_node_modules/b", true),
+        ("../ext/b", true),
+    ] {
+        let document = serde_json::json!({
+            "packages": {path: {"version": "1.0.0", "extraneous": true}}
+        });
+        assert_eq!(
+            super::raw::non_install_entries(&document).contains_key(path),
+            excluded,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn npm_non_install_delisted_parent_roundtrips_under_new_npm_pins() {
+    for flags in [
+        serde_json::json!({}),
+        serde_json::json!({"dev": true, "optional": true, "peer": true}),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("package-lock.json");
+        let member = dir.path().join("packages/b/inner");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            r#"{"name":"inner","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let mut parent = flags;
+        parent["version"] = serde_json::json!("1.0.0");
+        let mut original = serde_json::json!({
+            "name": "root", "lockfileVersion": 3, "requires": true,
+            "packages": {
+                "": {"name": "root", "workspaces": ["packages/b/inner"]},
+                "node_modules/inner": {"resolved": "packages/b/inner", "link": true},
+                "packages/b": parent,
+                "packages/b/inner": {"version": "1.0.0"}
+            }
+        });
+        super::write::sort_keys_like_npm(&mut original);
+        let bytes = format!("{}\n", serde_json::to_string_pretty(&original).unwrap());
+        for pin in ["npm@11.6.2", "npm@11.15.0", "npm@11.20.0"] {
+            std::fs::write(&file, &bytes).unwrap();
+            let graph = parse(&file).unwrap();
+            assert_eq!(graph.packages.len(), 1);
+            assert_eq!(graph.importers.len(), 2);
+            assert!(graph.importers.contains_key("packages/b/inner"));
+            assert!(!graph.importers.contains_key("packages/b"));
+            let manifest = serde_json::from_value(serde_json::json!({
+                "name": "root", "workspaces": ["packages/b/inner"], "packageManager": pin
+            }))
+            .unwrap();
+            write(&file, &graph, &manifest).unwrap();
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), bytes, "{pin}");
+        }
+    }
+}
