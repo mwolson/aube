@@ -151,6 +151,11 @@ pub fn write_with_project_root(
     // Key packages by `name@version` (ignore peer-context suffix) so
     // lookups from parent deps resolve to one canonical entry even if
     // the graph has several contextualized variants.
+    let existing: Option<serde_json::Value> = crate::read_lockfile(path)
+        .ok()
+        .and_then(|content| crate::parse_json(path, content).ok());
+    let prior_libc = PriorLibc::read(existing.as_ref(), manifest);
+    let write_libc = prior_libc.write_new;
     let mut canonical = crate::build_canonical_map(graph);
     for pkg in graph.packages.values().filter(|pkg| {
         matches!(
@@ -207,7 +212,7 @@ pub fn write_with_project_root(
     let root_key = ""; // npm's root importer install path.
 
     let mut packages: BTreeMap<String, WriteNpmPackage> = BTreeMap::new();
-    let libc_for = PriorLibc::read(path, manifest).decider();
+    let libc_for = prior_libc.decider();
 
     // Root importer entry — mirrors the manifest's dep fields.
     packages.insert(
@@ -220,7 +225,10 @@ pub fn write_with_project_root(
             optional_dependencies: borrow_map(&manifest.optional_dependencies),
             peer_dependencies: borrow_map(&manifest.peer_dependencies),
             engines: borrow_map(&manifest.engines),
-            workspaces: manifest.workspaces.as_ref(),
+            // npm omits a root `workspaces` that lists nothing.
+            workspaces: manifest.workspaces.as_ref().filter(|workspaces| {
+                !matches!(workspaces, aube_manifest::Workspaces::Array(patterns) if patterns.is_empty())
+            }),
             funding: manifest_funding(manifest),
             ..Default::default()
         },
@@ -241,6 +249,18 @@ pub fn write_with_project_root(
         })
         .collect();
 
+    // The parent of a bare `package-lock.json` path is empty and means cwd.
+    let absolute_project_dir = std::path::absolute(project_dir.join("."))
+        .map_err(|e| Error::Io(project_dir.to_path_buf(), e))?;
+    let member_folder_names: BTreeMap<_, _> = member_manifests
+        .iter()
+        .filter(|(_, member)| member.name.is_none())
+        .filter_map(|(importer, _)| {
+            let member_dir =
+                aube_util::path::normalize_lexical(&absolute_project_dir.join(importer));
+            npm_name_from_folder(&member_dir).map(|name| (*importer, name))
+        })
+        .collect();
     for (importer_path, importer_roots) in graph.importers.iter().filter(|(path, _)| *path != ".") {
         let (name, version, peer_dependencies, peer_dependencies_meta, declared) =
             if let Some(pkg) = workspace_package_for_importer(graph, importer_path) {
@@ -263,10 +283,9 @@ pub fn write_with_project_root(
             } else if let Some(manifest) = member_manifests.get(importer_path.as_str()) {
                 // npm links a nameless member under its folder name.
                 let Some(name) = manifest.name.as_deref().or_else(|| {
-                    importer_path
-                        .rsplit('/')
-                        .next()
-                        .filter(|segment| !segment.is_empty() && *segment != "..")
+                    member_folder_names
+                        .get(importer_path.as_str())
+                        .map(String::as_str)
                 }) else {
                     continue;
                 };
@@ -324,8 +343,7 @@ pub fn write_with_project_root(
         packages.insert(
             importer_path.clone(),
             WriteNpmPackage {
-                // npm names a member only when it differs from its folder.
-                name: (importer_path.rsplit('/').next() != Some(name)).then_some(name),
+                name: Some(name),
                 version,
                 has_install_script: importer_has_install_script,
                 os,
@@ -725,6 +743,44 @@ pub fn write_with_project_root(
             value["packages"][importer]["engines"] = engines.clone();
         }
     }
+    for importer in graph.importers.keys().filter(|path| *path != ".") {
+        let Some(entry) = value["packages"]
+            .get_mut(importer)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        let old_entry = existing
+            .as_ref()
+            .and_then(|doc| doc["packages"].get(importer));
+        let member = member_manifests.get(importer.as_str());
+        // npm omits a name that matches the member's folder, taken from its
+        // lexical path rather than a symlink's target.
+        let folder_name = npm_name_from_folder(&aube_util::path::normalize_lexical(
+            &absolute_project_dir.join(importer),
+        ));
+        if member.is_some_and(|manifest| manifest.name.is_none())
+            || entry.get("name").and_then(serde_json::Value::as_str) == folder_name.as_deref()
+        {
+            entry.remove("name");
+        }
+        for key in ["os", "cpu", "libc"] {
+            // A loaded manifest is authoritative, so an empty value clears the field.
+            if key != "libc" && member.is_some() {
+                entry.remove(key);
+            }
+            let value = member.map_or_else(
+                || old_entry.and_then(|old| old.get(key)).cloned(),
+                |member| member.extra.get(key).cloned(),
+            );
+            if (key != "libc" || write_libc)
+                && let Some(value) = value
+                && npm_meta_value(&value)
+            {
+                entry.insert(key.into(), value);
+            }
+        }
+    }
     for (install_path, canonical_key) in &placed {
         if let Some(entries) = canonical
             .get(canonical_key)
@@ -827,6 +883,15 @@ pub fn write_with_project_root(
         } else {
             entry.remove("peer");
         }
+    }
+    // npm drops a root entry with nothing to record.
+    if let Some(packages) = value["packages"].as_object_mut()
+        && packages
+            .get(root_key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(serde_json::Map::is_empty)
+    {
+        packages.remove(root_key);
     }
     sort_keys_like_npm(&mut value);
     let mut body =
@@ -940,6 +1005,21 @@ fn locale_compare_en(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
+fn npm_name_from_folder(path: &Path) -> Option<String> {
+    let base = path.file_name()?.to_str()?;
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|p| p.to_str());
+    Some(
+        if let Some(parent) = parent.filter(|parent| parent.starts_with('@')) {
+            format!("{parent}/{base}")
+        } else {
+            base.to_string()
+        },
+    )
+}
+
 fn npm_libc(
     pkg: &LockedPackage,
     install_path: &str,
@@ -1004,15 +1084,14 @@ struct PriorLibc {
 }
 
 impl PriorLibc {
-    fn read(path: &Path, manifest: &aube_manifest::PackageJson) -> Self {
+    fn read(document: Option<&serde_json::Value>, manifest: &aube_manifest::PackageJson) -> Self {
         let mut prior = Self {
             known: BTreeSet::new(),
             with_libc: BTreeSet::new(),
             write_new: false,
         };
-        if let Ok(content) = crate::read_lockfile(path)
-            && let Ok(document) = crate::parse_json::<serde_json::Value>(path, content)
-            && let Ok(raw) = <RawNpmLockfile as serde::Deserialize>::deserialize(&document)
+        if let Some(document) = document
+            && let Ok(raw) = <RawNpmLockfile as serde::Deserialize>::deserialize(document)
         {
             prior.write_new = document["packages"]
                 .as_object()
