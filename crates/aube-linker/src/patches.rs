@@ -147,6 +147,129 @@ fn apply_with_eof_context(
     diffy::apply(original, &annotated)
 }
 
+/// Match pnpm's positions and trailing-whitespace tolerance first, then
+/// preserve the existing unbounded exact and EOF-context fallbacks.
+fn apply_with_tolerance(original: &str, patch: &diffy::Patch<'_, str>) -> Result<String, String> {
+    apply_tolerant_hunks(original, patch)
+        .or_else(|_| apply_with_eof_context(original, patch).map_err(|error| error.to_string()))
+}
+
+fn apply_tolerant_hunks(original: &str, patch: &diffy::Patch<'_, str>) -> Result<String, String> {
+    let mut lines: Vec<_> = original.split('\n').collect();
+    let mut edits = Vec::new();
+    for (index, hunk) in patch.hunks().iter().enumerate() {
+        let range = hunk.old_range();
+        // Locate every hunk against the original file, as pnpm does.
+        let position = std::iter::once(0)
+            .chain((1..=20).flat_map(|offset| [-offset, offset]))
+            .filter_map(|offset| {
+                range
+                    .start()
+                    .checked_add_signed(offset)?
+                    .checked_sub(usize::from(!range.is_empty()))
+            })
+            .find(|&position| {
+                let Some(fragment) = lines
+                    .get(position..)
+                    .and_then(|tail| tail.get(..range.len()))
+                else {
+                    return false;
+                };
+                hunk.lines()
+                    .iter()
+                    .filter_map(|line| match line {
+                        diffy::Line::Context(text) | diffy::Line::Delete(text) => {
+                            Some(text.trim_end())
+                        }
+                        diffy::Line::Insert(_) => None,
+                    })
+                    .eq(fragment.iter().map(|text| text.trim_end()))
+            })
+            .ok_or_else(|| format!("error applying hunk #{}", index + 1))?;
+        plan_hunk_edits(&mut edits, position, hunk.lines());
+    }
+
+    let mut inserted = 0_usize;
+    let mut deleted = 0_usize;
+    for edit in edits {
+        match edit {
+            PatchEdit::Splice {
+                index,
+                delete,
+                insert,
+            } => {
+                let at = index
+                    .saturating_add(inserted)
+                    .saturating_sub(deleted)
+                    .min(lines.len());
+                inserted = inserted.saturating_add(insert.len());
+                deleted = deleted.saturating_add(delete);
+                // Overlapping hunks can move a splice beyond EOF. pnpm
+                // follows JavaScript's clamping behavior there.
+                lines.splice(at..at.saturating_add(delete).min(lines.len()), insert);
+            }
+            PatchEdit::FinalNewline(true) => lines.push(""),
+            PatchEdit::FinalNewline(false) => {
+                lines.pop();
+            }
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+enum PatchEdit<'a> {
+    Splice {
+        index: usize,
+        delete: usize,
+        insert: Vec<&'a str>,
+    },
+    FinalNewline(bool),
+}
+
+fn plan_hunk_edits<'a>(
+    edits: &mut Vec<PatchEdit<'a>>,
+    mut index: usize,
+    lines: &[diffy::Line<'a, str>],
+) {
+    for run in lines.chunk_by(|a, b| std::mem::discriminant(a) == std::mem::discriminant(b)) {
+        match run[0] {
+            diffy::Line::Context(_) => index += run.len(),
+            diffy::Line::Delete(_) => {
+                edits.push(PatchEdit::Splice {
+                    index,
+                    delete: run.len(),
+                    insert: Vec::new(),
+                });
+                index += run.len();
+                if let Some(diffy::Line::Delete(text)) = run.last()
+                    && !text.ends_with('\n')
+                {
+                    edits.push(PatchEdit::FinalNewline(true));
+                }
+            }
+            diffy::Line::Insert(_) => {
+                let insert = run
+                    .iter()
+                    .filter_map(|line| match line {
+                        diffy::Line::Insert(text) => Some(text.strip_suffix('\n').unwrap_or(text)),
+                        _ => None,
+                    })
+                    .collect();
+                edits.push(PatchEdit::Splice {
+                    index,
+                    delete: 0,
+                    insert,
+                });
+                if let Some(diffy::Line::Insert(text)) = run.last()
+                    && !text.ends_with('\n')
+                {
+                    edits.push(PatchEdit::FinalNewline(false));
+                }
+            }
+        }
+    }
+}
+
 /// Apply a multi-file unified diff to a package directory.
 ///
 /// The patch text is split on git-style or plain unified-diff file
@@ -255,30 +378,10 @@ pub(crate) fn apply_multi_file_patch(pkg_dir: &Path, patch_text: &str) -> Result
             }
             continue;
         }
-        // git-style patches always use LF line endings, but published
-        // tarballs frequently ship files with CRLF (Windows editors,
-        // `core.autocrlf=true` checkouts). Diffy is byte-exact and
-        // refuses to match CRLF context against LF hunk lines, so we
-        // normalize the original to LF before applying and restore the
-        // CRLF on write. pnpm's patch applier does the same thing.
-        let was_crlf = original.contains("\r\n");
-        let normalized = if was_crlf {
-            original.replace("\r\n", "\n")
-        } else {
-            original
-        };
         let parsed = diffy::Patch::from_str(&section.body)
             .map_err(|e| format!("failed to parse patch for {rel}: {e}"))?;
-        let patched_lf = apply_with_eof_context(&normalized, &parsed)
+        let patched = apply_with_tolerance(&original, &parsed)
             .map_err(|e| format!("failed to apply patch for {rel}: {e}"))?;
-        let patched = if was_crlf {
-            // Promote bare `\n` to `\r\n`, then collapse any `\r\r\n`
-            // back so a patch line containing a literal `\r` byte (rare
-            // but legal for binary-ish text) doesn't gain a second CR.
-            patched_lf.replace('\n', "\r\n").replace("\r\r\n", "\r\n")
-        } else {
-            patched_lf
-        };
         // Break any reflink/hardlink to the global store before
         // writing the patched bytes — otherwise we'd silently mutate
         // every other project sharing this CAS file. Stage the write
@@ -506,7 +609,13 @@ fn split_patch_sections(text: &str) -> Vec<PatchSection> {
                 body.push_str(&format!("--- a/{rel}\n"));
             }
         }
-        body.push_str(stripped);
+        // CR in hunk content belongs to the patch's text. Strip it
+        // only from headers, where it must not become part of a path.
+        body.push_str(if hunk_remaining.is_some() {
+            line.strip_suffix('\n').unwrap_or(line)
+        } else {
+            stripped
+        });
         body.push('\n');
         if let Some(counts) = hunk_line_counts(stripped) {
             hunk_remaining = (counts != (0, 0)).then_some(counts);
@@ -596,6 +705,168 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(pkg.join("index.js")).unwrap(),
             "module.exports = 'new';\n"
+        );
+    }
+
+    #[test]
+    fn tolerates_trailing_whitespace_without_rewriting_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "heading \t\nold \t\nend\n").unwrap();
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n heading\n-old\n+new \t\n end\n";
+        apply_multi_file_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"heading \t\nnew \t\nend\n"
+        );
+    }
+
+    #[test]
+    fn tolerates_trailing_whitespace_in_unterminated_eof_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\nend \t").unwrap();
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-old\n+new\n end\n";
+        apply_multi_file_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"new\nend \t"
+        );
+    }
+
+    #[test]
+    fn tolerant_patches_match_pnpm_positions_and_line_endings() {
+        for (name, original, patch, expected) in [
+            (
+                "duplicate",
+                "a \nb\nx\na\nb\n",
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n",
+                "a \nB\nx\na\nb\n",
+            ),
+            (
+                "mixed-hunks",
+                "one\ntwo\nthree \nfour\n",
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+extra\n@@ -3,2 +4,2 @@\n three\n-four\n+FOUR\n",
+                "one\nTWO\nextra\nthree \nFOUR\n",
+            ),
+            (
+                "mixed-endings",
+                "one\r\ntwo\nthree\r\nfour\n",
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three\n four\n",
+                "one\r\nTWO\nthree\r\nfour\n",
+            ),
+            (
+                "insert-no-newline",
+                "old \n",
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\n",
+                "new",
+            ),
+            (
+                "crlf-patch-lf-file",
+                "one\ntwo\nthree\n",
+                "diff --git a/a.txt b/a.txt\r\n--- a/a.txt\r\n+++ b/a.txt\r\n@@ -1,3 +1,3 @@\r\n one\r\n-two\r\n+TWO\r\n three\r\n",
+                "one\nTWO\r\nthree\n",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), original).unwrap();
+            apply_multi_file_patch(dir.path(), patch).unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("a.txt")).unwrap(),
+                expected.as_bytes(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_start_nonempty_hunks_keep_pnpm_offset_window() {
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -0 +1 @@\n-old\n+new\n";
+        for position in [19, 20] {
+            let dir = tempfile::tempdir().unwrap();
+            let padding = "pad\n".repeat(position);
+            let original = format!("{padding}old \n");
+            std::fs::write(dir.path().join("a.txt"), &original).unwrap();
+            let applied = apply_multi_file_patch(dir.path(), patch);
+            let expected = if position == 19 {
+                assert!(applied.is_ok());
+                format!("{padding}new\n")
+            } else {
+                assert!(applied.is_err());
+                original
+            };
+            assert_eq!(
+                std::fs::read(dir.path().join("a.txt")).unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn exactly_matching_patches_keep_diffy_output_bytes() {
+        for (original, expected) in [
+            ("one \t\nold\nend ", "one \t\nnew \t\nend "),
+            ("one \t\r\nold\r\nend\r\n", "one \t\r\nnew \t\r\nend\r\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.txt"), original).unwrap();
+            let patch = diffy::create_patch(original, expected).to_string();
+            let body = patch.splitn(3, '\n').nth(2).unwrap();
+            let patch = format!("--- a/a.txt\n+++ b/a.txt\n{body}");
+            let parsed = diffy::Patch::from_str(&patch).unwrap();
+            assert_eq!(
+                diffy::apply(original, &parsed).unwrap().as_bytes(),
+                expected.as_bytes()
+            );
+            apply_multi_file_patch(dir.path(), &patch).unwrap();
+            assert_eq!(
+                std::fs::read(dir.path().join("a.txt")).unwrap(),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn tolerant_hunks_use_original_positions_before_splicing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one \ntwo\nthree \nfour\n").unwrap();
+        let patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,3 @@\n one\n-two\n+TWO\n+extra\n@@ -3,2 +4,2 @@\n three\n-four\n+FOUR\n";
+        apply_multi_file_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"one \nTWO\nextra\nthree \nFOUR\n"
+        );
+    }
+
+    #[test]
+    fn tolerant_offsets_are_limited_without_restricting_exact_matches() {
+        let patch = diffy::Patch::from_str("--- a\n+++ b\n@@ -31 +31 @@\n-old\n+new\n").unwrap();
+        for offset in [-21_isize, -20, 20, 21] {
+            let position = 30_usize.checked_add_signed(offset).unwrap();
+            let padding = "pad\n".repeat(position);
+            let exact = format!("{padding}old\n");
+            assert_eq!(
+                apply_with_tolerance(&exact, &patch).unwrap(),
+                format!("{padding}new\n")
+            );
+            for ending in [" \t\n", "\r\n"] {
+                let tolerant = format!("{padding}old{ending}");
+                let applied = apply_with_tolerance(&tolerant, &patch);
+                if offset.abs() <= 20 {
+                    assert_eq!(applied.unwrap(), format!("{padding}new\n"));
+                } else {
+                    assert!(applied.is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn eof_only_offsets_keep_existing_unbounded_search() {
+        let patch =
+            diffy::Patch::from_str("--- a\n+++ b\n@@ -1,2 +1,2 @@\n-old\n+new\n end\n").unwrap();
+        let padding = "pad\n".repeat(21);
+        assert_eq!(
+            apply_with_tolerance(&format!("{padding}old\nend"), &patch).unwrap(),
+            format!("{padding}new\nend")
         );
     }
 
@@ -742,11 +1013,6 @@ mod tests {
         for newline in ["\n", "\r\n"] {
             for marker in ["", "\\ No newline at end of file\n"] {
                 for terminated in [false, true] {
-                    // An explicit missing-newline marker correctly rejects
-                    // a terminated source file, so it is not a tolerance case.
-                    if terminated && !marker.is_empty() {
-                        continue;
-                    }
                     let dir = tempfile::tempdir().unwrap();
                     let ending = if terminated { newline } else { "" };
                     std::fs::write(
@@ -766,7 +1032,7 @@ mod tests {
                     apply_multi_file_patch(dir.path(), &patch).unwrap();
                     assert_eq!(
                         std::fs::read_to_string(dir.path().join("index.js")).unwrap(),
-                        format!("module.exports = 2;{newline}// end{ending}")
+                        format!("module.exports = 2;\n// end{ending}")
                     );
                 }
             }
@@ -824,7 +1090,7 @@ mod tests {
     #[test]
     fn eof_context_tolerance_does_not_hide_content_mismatches() {
         let dir = tempfile::tempdir().unwrap();
-        for original in ["wrong\nend", "old\nwrong", "old\nend "] {
+        for original in ["wrong\nend", "old\nwrong"] {
             std::fs::write(dir.path().join("index.js"), original).unwrap();
             let patch = "diff --git a/index.js b/index.js\n\
                          --- a/index.js\n\
@@ -912,10 +1178,7 @@ mod tests {
 
     #[test]
     fn applies_lf_patch_against_crlf_file() {
-        // Tarballs published from Windows editors ship CRLF text. pnpm
-        // / git emit LF-only patches even against those files. Diffy is
-        // byte-exact, so the apply path normalizes CRLF -> LF before
-        // matching and restores CRLF on write.
+        // pnpm keeps untouched CRLF lines and inserts the patch's LF text.
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -931,15 +1194,12 @@ mod tests {
                      \x20three\n";
         apply_multi_file_patch(&pkg, patch).unwrap();
         let bytes = std::fs::read(pkg.join("a.txt")).unwrap();
-        assert_eq!(bytes, b"one\r\nTWO\r\nthree\r\n");
+        assert_eq!(bytes, b"one\r\nTWO\nthree\r\n");
     }
 
     #[test]
-    fn crlf_restore_preserves_embedded_cr_byte() {
-        // A patch line that adds a literal `\r` byte mid-line must not
-        // gain a second `\r` when we re-CRLF the output. Naive
-        // `replace('\n', "\r\n")` would turn `\r\n` into `\r\r\n`; the
-        // `\r\r\n` collapse undoes that.
+    fn tolerant_apply_preserves_embedded_cr_byte() {
+        // Inserted text keeps embedded CR bytes as well as its LF ending.
         let dir = tempfile::tempdir().unwrap();
         let pkg = dir.path().join("pkg");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -953,7 +1213,7 @@ mod tests {
                      \x20two\n";
         apply_multi_file_patch(&pkg, patch).unwrap();
         let bytes = std::fs::read(pkg.join("a.txt")).unwrap();
-        assert_eq!(bytes, b"has\rcr\r\ntwo\r\n");
+        assert_eq!(bytes, b"has\rcr\ntwo\r\n");
     }
 
     #[test]
