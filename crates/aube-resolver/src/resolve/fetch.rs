@@ -37,6 +37,7 @@ pub(super) struct FetchScheduler {
     cache_dir: Option<PathBuf>,
     full_cache_dir: Option<PathBuf>,
     mra_exclude: crate::trust::PackageVersionPolicy,
+    full_metadata: bool,
     force_metadata_primer: bool,
     needs_time: bool,
 }
@@ -81,6 +82,7 @@ impl FetchScheduler {
                 .as_ref()
                 .map(|m| m.exclude.clone())
                 .unwrap_or_else(crate::trust::PackageVersionPolicy::empty),
+            full_metadata: resolver.full_metadata,
             force_metadata_primer: resolver.force_metadata_primer,
             needs_time,
         }
@@ -117,8 +119,9 @@ impl FetchScheduler {
         // Only a name-only exclude lets us skip the cutoff sight-unseen;
         // a version-specific rule still needs publish times to tell which
         // versions are exempt, so it falls through to the cutoff check.
-        let primer_covers_cutoff = self.mra_exclude.matches_name_only(name)
-            || published_by.is_none_or(crate::primer::covers_cutoff);
+        let primer_covers_cutoff = !self.full_metadata
+            && (self.mra_exclude.matches_name_only(name)
+                || published_by.is_none_or(crate::primer::covers_cutoff));
         let inputs = FetchInputs {
             name: name.to_string(),
             client: self.client.clone(),
@@ -152,8 +155,9 @@ impl FetchScheduler {
         if !self.active_fetches.insert(key.clone()) {
             return;
         }
-        let primer_covers_cutoff = self.mra_exclude.matches_name_only(name)
-            || published_by.is_none_or(crate::primer::covers_cutoff);
+        let primer_covers_cutoff = !self.full_metadata
+            && (self.mra_exclude.matches_name_only(name)
+                || published_by.is_none_or(crate::primer::covers_cutoff));
         let inputs = FetchInputs {
             name: name.to_string(),
             client: self.client.clone(),
@@ -637,6 +641,40 @@ mod tests {
         body: Vec<u8>,
     ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         serve_registry_responses(vec![body]).await
+    }
+
+    #[tokio::test]
+    async fn full_metadata_ignores_abbreviated_cache_and_reuses_full_funding() {
+        let funding = serde_json::json!([{"type":"github","url":"https://example.com/one"}, "https://example.com/two"]);
+        let full = serde_json::json!({"name":"shared","dist-tags":{"latest":"1.0.0"},"versions":{
+            "1.0.0":{"name":"shared","version":"1.0.0","funding":funding}
+        }});
+        let abbreviated: Packument =
+            serde_json::from_value(serde_json::json!({"name":"shared","versions":{
+                "1.0.0":{"name":"shared","version":"1.0.0"}
+            }}))
+            .unwrap();
+        let (registry, requests, server) = serve_registry(serde_json::to_vec(&full).unwrap()).await;
+        let cache = tempfile::tempdir().unwrap();
+        let client = Arc::new(RegistryClient::new(&registry));
+        client.replace_packument_cache("shared", &cache.path().join("compact"), &abbreviated);
+        for expected_source in [FetchSource::Network, FetchSource::Disk] {
+            let mut resolver = Resolver::new(Arc::clone(&client))
+                .with_full_metadata(true)
+                .with_packument_cache(cache.path().join("compact"))
+                .with_packument_full_cache(cache.path().join("full"));
+            let manifest = aube_manifest::PackageJson {
+                dependencies: [("shared".into(), "1.0.0".into())].into(),
+                ..Default::default()
+            };
+            let graph = resolver.resolve(&manifest, None).await.unwrap();
+            assert_eq!(
+                graph.packages["shared@1.0.0"].extra_meta[aube_lockfile::EXTRA_NPM_FUNDING],
+                funding
+            );
+            assert_eq!(requests.load(Ordering::Relaxed), 1, "{expected_source:?}");
+        }
+        server.abort();
     }
 
     #[tokio::test]

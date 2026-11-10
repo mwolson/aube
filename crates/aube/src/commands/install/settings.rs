@@ -1355,6 +1355,10 @@ pub(crate) fn configure_resolver(
         .with_resolve_peers_from_workspace_root(resolve_peers_from_workspace_root_opt)
         .with_registry_supports_time_field(registry_supports_time_field)
         .with_force_metadata_primer(force_metadata_primer)
+        .with_full_metadata(matches!(
+            target_lockfile_kind,
+            Some(aube_lockfile::LockfileKind::Npm | aube_lockfile::LockfileKind::NpmShrinkwrap)
+        ))
         .with_supported_architectures(supported_architectures)
         .with_overrides(effective_overrides)
         .with_ignored_optional_dependencies(ignored_optional)

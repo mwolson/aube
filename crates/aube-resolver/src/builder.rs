@@ -52,6 +52,7 @@ impl Resolver {
             resolve_peers_from_workspace_root: true,
             registry_supports_time_field: false,
             force_metadata_primer: false,
+            full_metadata: false,
             packument_network_concurrency: None,
         }
     }
@@ -99,6 +100,7 @@ impl Resolver {
                 resolve_peers_from_workspace_root: true,
                 registry_supports_time_field: false,
                 force_metadata_primer: false,
+                full_metadata: false,
                 packument_network_concurrency: None,
             },
             rx,
@@ -107,6 +109,12 @@ impl Resolver {
 
     pub fn with_packument_network_concurrency(mut self, n: Option<usize>) -> Self {
         self.packument_network_concurrency = n.filter(|&n| n > 0);
+        self
+    }
+
+    /// Fetch complete manifests for npm lockfile metadata, bypassing the reduced primer.
+    pub fn with_full_metadata(mut self, enabled: bool) -> Self {
+        self.full_metadata = enabled;
         self
     }
 

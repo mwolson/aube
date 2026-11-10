@@ -940,6 +940,7 @@ mod tests {
             engines: BTreeMap::new(),
             license: None,
             funding_url: None,
+            funding: None,
             bin: BTreeMap::new(),
             has_install_script: false,
             deprecated: None,
