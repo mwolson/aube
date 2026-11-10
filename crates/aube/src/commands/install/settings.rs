@@ -1,4 +1,3 @@
-use super::version_from_dep_path;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
@@ -1402,7 +1401,7 @@ pub(super) fn check_unmet_peers(
         "Issues with peer dependencies found",
     );
     for u in &unmet {
-        let from_ver = version_from_dep_path(&u.from_dep_path, &u.from_name);
+        let from_ver = &u.from_version;
         let msg = match &u.found {
             Some(found) => format!(
                 "  {}@{from_ver}: expected peer {}@{}, found {found}",
@@ -1442,7 +1441,7 @@ pub(crate) struct PeerDependencyRules {
     ignore_missing: Vec<glob::Pattern>,
     allow_any: Vec<glob::Pattern>,
     /// Keys are pnpm selectors: either a bare peer name (`react`) or a
-    /// scoped `parent>peer` pair (`styled-components>react`). Values are
+    /// `parent[@range]>peer` pair (`ws@7>utf-8-validate`). Values are
     /// additional semver ranges; a peer resolving inside *either* the
     /// declared range or this override is treated as satisfied.
     allowed_versions: BTreeMap<String, String>,
@@ -1490,33 +1489,42 @@ impl PeerDependencyRules {
             return true;
         }
         if let Some(found) = u.found.as_deref()
-            && self.allowed_versions_permit(&u.from_name, &u.peer_name, found)
+            && self.allowed_versions_permit(u, found)
         {
             return true;
         }
         false
     }
 
-    fn allowed_versions_permit(&self, parent: &str, peer: &str, found: &str) -> bool {
-        let scoped_key = format!("{parent}>{peer}");
-        let candidates = [
-            self.allowed_versions.get(&scoped_key),
-            self.allowed_versions.get(peer),
-        ];
-        let Ok(found_v) = node_semver::Version::parse(found) else {
-            return false;
-        };
-        candidates
-            .into_iter()
-            .flatten()
-            .any(|range| matches_range(range, &found_v))
+    fn allowed_versions_permit(&self, u: &aube_resolver::UnmetPeer, found: &str) -> bool {
+        self.allowed_versions.iter().any(|(selector, ranges)| {
+            let target = if let Some((parent, target)) = selector.split_once('>') {
+                let (parent, range) = peer_rule_selector(parent.trim());
+                if parent != u.from_registry_name
+                    || range.is_some_and(|range| {
+                        !aube_resolver::peer_version_satisfies(&u.from_version, range)
+                    })
+                {
+                    return false;
+                }
+                target.trim()
+            } else {
+                selector.as_str()
+            };
+            let (peer, _) = peer_rule_selector(target);
+            peer == u.peer_name
+                && ranges
+                    .split("||")
+                    .any(|range| aube_resolver::peer_version_satisfies(found, range.trim()))
+        })
     }
 }
 
-fn matches_range(range: &str, found: &node_semver::Version) -> bool {
-    match node_semver::Range::parse(range) {
-        Ok(r) => r.satisfies(found),
-        Err(_) => false,
+fn peer_rule_selector(selector: &str) -> (&str, Option<&str>) {
+    // Skip the leading scope marker when looking for a version delimiter.
+    match selector.char_indices().skip(1).find(|(_, c)| *c == '@') {
+        Some((at, _)) => (&selector[..at], Some(&selector[at + 1..])),
+        None => (selector, None),
     }
 }
 
@@ -1702,6 +1710,8 @@ mod peer_dependency_rules_tests {
         aube_resolver::UnmetPeer {
             from_dep_path: format!("{parent}@0.0.0"),
             from_name: parent.to_string(),
+            from_registry_name: parent.to_string(),
+            from_version: "0.0.0".to_string(),
             peer_name: peer.to_string(),
             declared: declared.to_string(),
             found: found.map(String::from),
@@ -1775,6 +1785,130 @@ mod peer_dependency_rules_tests {
         )));
         // Different parent — not silenced.
         assert!(!r.silences(&unmet("other-lib", "react", "^18.0.0", Some("19.0.0"))));
+    }
+
+    #[test]
+    fn allowed_versions_versioned_parent_checks_declaring_version() {
+        let r = rules(&[], &[], &[("ws@7>utf-8-validate", "6")]);
+        let mut u = unmet("ws", "utf-8-validate", "^5.0.2", Some("6.0.6"));
+        u.from_version = "7.5.11".to_string();
+        assert!(r.silences(&u));
+        u.from_version = "8.0.0".to_string();
+        assert!(!r.silences(&u));
+    }
+
+    #[test]
+    fn allowed_versions_scoped_parent_admits_prerelease_with_star() {
+        let r = rules(
+            &[],
+            &[],
+            &[("@react-navigation/native-stack@7>react-native-screens", "*")],
+        );
+        let mut u = unmet(
+            "@react-navigation/native-stack",
+            "react-native-screens",
+            ">=4.0.0",
+            Some("5.0.0-t3.48"),
+        );
+        u.from_version = "7.8.0".to_string();
+        assert!(r.silences(&u));
+        u.from_registry_name = "other-stack".to_string();
+        assert!(!r.silences(&u));
+    }
+
+    #[test]
+    fn allowed_versions_bare_version_selectors_and_parent_rules_accumulate() {
+        let r = rules(
+            &[],
+            &[],
+            &[
+                ("react@18", "^19.0.0 || 20"),
+                ("parent@1>react@18", "21"),
+                ("parent@1>react", "22"),
+            ],
+        );
+        for found in ["19.3.0-canary-x", "20.1.0", "21.0.0", "22.0.0"] {
+            let mut u = unmet("parent", "react", "^18", Some(found));
+            u.from_version = "1.0.0".to_string();
+            assert!(r.silences(&u), "{found}");
+        }
+        assert!(!r.silences(&unmet("parent", "react", "^18", Some("23.0.0"))));
+        assert!(!r.silences(&unmet("parent", "react", "^18", Some("19.0.0-rc.1"))));
+    }
+
+    #[test]
+    fn allowed_versions_empty_pieces_do_not_widen_rules() {
+        let u = unmet("ws", "utf-8-validate", "^5.0.2", Some("6.0.6"));
+        for (selector, value, silenced) in [
+            ("utf-8-validate", "5 ||", false),
+            ("utf-8-validate", " || 5", false),
+            ("utf-8-validate", "", false),
+            ("utf-8-validate", "  ", false),
+            ("utf-8-validate", "5 || || 6", true),
+            ("ws@>utf-8-validate", "6", false),
+            (" ws > utf-8-validate ", "6", true),
+        ] {
+            assert_eq!(
+                rules(&[], &[], &[(selector, value)]).silences(&u),
+                silenced,
+                "{selector}: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_versions_t3_scoped_parent_and_spaced_rule_value() {
+        let u = unmet(
+            "@react-navigation/native-stack",
+            "react-native-screens",
+            ">= 4.0.0",
+            Some("5.0.0-t3.48"),
+        );
+        for value in ["*", ">= 4.0.0"] {
+            // Spaced operators in rule values deliberately retain their usual
+            // meaning, differing from pnpm's deps-inspection tokenization.
+            let r = rules(
+                &[],
+                &[],
+                &[("@react-navigation/native-stack>react-native-screens", value)],
+            );
+            assert!(r.silences(&u), "{value}");
+        }
+    }
+
+    #[test]
+    fn allowed_versions_uses_real_parent_name_and_manifest_version() {
+        let r = rules(&[], &[], &[("ws@7>utf-8-validate", "6")]);
+        for (name, alias_of, dep_path) in [
+            ("ws7", Some("ws"), "ws7@npm:ws@7.5.11"),
+            ("ws", None, "ws@file:../ws"),
+            ("ws", None, "ws@link:../ws"),
+            ("ws", None, "ws@git+https://example.com/ws.git#abc"),
+            ("ws", None, "ws@https://example.com/ws.tgz"),
+        ] {
+            let parent = aube_lockfile::LockedPackage {
+                name: name.into(),
+                alias_of: alias_of.map(String::from),
+                version: "7.5.11".into(),
+                dep_path: dep_path.into(),
+                dependencies: [("utf-8-validate".into(), "6.0.6".into())].into(),
+                peer_dependencies: [("utf-8-validate".into(), "^5.0.2".into())].into(),
+                ..Default::default()
+            };
+            let graph = aube_lockfile::LockfileGraph {
+                packages: [(dep_path.into(), parent)].into(),
+                ..Default::default()
+            };
+            let unmet = aube_resolver::detect_unmet_peers(&graph);
+            assert_eq!(unmet.len(), 1, "{dep_path}");
+            assert_eq!(unmet[0].from_name, name);
+            assert_eq!(unmet[0].from_registry_name, "ws");
+            assert_eq!(unmet[0].from_version, "7.5.11");
+            assert!(r.silences(&unmet[0]), "{dep_path}");
+            if alias_of.is_some() {
+                assert!(!rules(&[], &[], &[("ws7>utf-8-validate", "6")]).silences(&unmet[0]));
+            }
+        }
     }
 
     #[test]

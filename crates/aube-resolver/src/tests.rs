@@ -3780,6 +3780,65 @@ fn detect_unmet_peers_silent_when_satisfied() {
     assert!(detect_unmet_peers(&graph).is_empty());
 }
 
+#[test]
+fn detect_unmet_peers_uses_combined_pnpm_checks_and_normalization() {
+    for (version, range, satisfied) in [
+        ("19.3.0-canary-x", "^19.0.0", true),
+        ("19.0.0-rc.1", "^19.0.0", true),
+        ("2.0.0-beta.1", ">=2.0.0", true),
+        ("5.0.0-t3.48", ">=4.0.0", true),
+        ("5.0.0-t3.48", ">= 4.0.0", true),
+        ("19.3.0-canary-x", "*", true),
+        ("19.3.0-canary-x", "  ", true),
+        ("20.0.0-beta.1", "^19.0.0", false),
+        ("20.0.0-beta.1", "<20.0.0", true),
+        ("19.0.0-rc.1", ">=18.0.0 <19.0.0", true),
+        ("20.0.0", ">=18.0.0 <19.0.0", false),
+        ("19.3.0-canary-x", "^18.0.0 || ^19.0.0", true),
+        ("1.9.5-beta", "~1.9.0", true),
+        ("2.0.0-beta", "~1.9.0", false),
+        ("1.0.0-beta", "1", true),
+        ("1.2.9-beta", "<=1.2", true),
+        ("1.2.9", "<=1.2", true),
+        ("1.9.0", "<=1", true),
+        ("1.3.0", "<=1.2", false),
+        ("1.3.0-beta", "<=1.2", false),
+        ("1.0.0-beta", "<1", false),
+        ("1.5.0-beta", "1.0.0 - 1.9.0", true),
+        ("custom-tag", "custom-tag", true),
+        ("custom-tag", "*", true),
+        ("custom-tag", "^19.0.0", false),
+        ("19.0.0", "not-a-range", true),
+        ("6.0.6", "^5.0.2", false),
+        ("19.0.0-rc.1", "workspace:^19", true),
+        ("19.0.0-rc.1", "workspace:^", true),
+        ("19.0.0-rc.1", "npm:react@^19", true),
+        ("19.0.0-rc.1", "work:^18 || work:^19", true),
+        ("19.0.0", "work:^18", false),
+        ("19.0.0", "file:../react", true),
+    ] {
+        let consumer = mk_locked(
+            "consumer",
+            "1.0.0",
+            &[("react", version)],
+            &[("react", range)],
+        );
+        let provider = mk_locked("react", version, &[], &[]);
+        let graph = LockfileGraph {
+            packages: [consumer, provider]
+                .into_iter()
+                .map(|pkg| (pkg.dep_path.clone(), pkg))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            detect_unmet_peers(&graph).is_empty(),
+            satisfied,
+            "{version} against {range}"
+        );
+    }
+}
+
 // Peer declared but completely absent from `pkg.dependencies` —
 // exercises the `found: None` branch that drives the "missing
 // required peer" display path in `check_unmet_peers`. Rare in

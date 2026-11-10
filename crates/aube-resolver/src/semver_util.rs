@@ -641,7 +641,10 @@ pub(crate) fn normalize_range(range_str: &str) -> &str {
 /// slice of ranges, lock contention would erase the parse savings.
 /// Two workers parsing the same range twice is cheaper than one
 /// lock round-trip.
-fn with_cached_range<R>(range_str: &str, f: impl FnOnce(Option<&node_semver::Range>) -> R) -> R {
+pub(crate) fn with_cached_range<R>(
+    range_str: &str,
+    f: impl FnOnce(Option<&node_semver::Range>) -> R,
+) -> R {
     thread_local! {
         static CACHE: std::cell::RefCell<crate::FxHashMap<String, Option<node_semver::Range>>> =
             std::cell::RefCell::default();
@@ -659,7 +662,10 @@ fn with_cached_range<R>(range_str: &str, f: impl FnOnce(Option<&node_semver::Ran
 // Mirrors with_cached_range. Locked-version side hits same string
 // thousands of times across peer-context + dedupe passes. Hit rate
 // trends to 1.0 after first BFS layer.
-fn with_cached_version<R>(version: &str, f: impl FnOnce(Option<&node_semver::Version>) -> R) -> R {
+pub(crate) fn with_cached_version<R>(
+    version: &str,
+    f: impl FnOnce(Option<&node_semver::Version>) -> R,
+) -> R {
     thread_local! {
         static CACHE: std::cell::RefCell<crate::FxHashMap<String, Option<node_semver::Version>>> =
             std::cell::RefCell::default();

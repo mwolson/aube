@@ -30,6 +30,10 @@ pub struct UnmetPeer {
     pub from_dep_path: String,
     /// Human-friendly package name (pre-context) for display.
     pub from_name: String,
+    /// Real package name for parent selectors, resolving any npm alias.
+    pub from_registry_name: String,
+    /// Manifest version of the declaring package, independent of source identity.
+    pub from_version: String,
     /// Name of the peer being declared (e.g. `"react"`).
     pub peer_name: String,
     /// The declared peer range from the package's packument
@@ -43,8 +47,9 @@ pub struct UnmetPeer {
 }
 
 /// Scan declared peers for missing required providers and incompatible
-/// provided versions. Missing optional peers are allowed; a provided optional
-/// peer still reports a version mismatch, matching pnpm.
+/// provided versions rejected by both pnpm's normalized resolver and interval
+/// checks. Missing optional peers are allowed; a provided optional peer still
+/// reports a version mismatch.
 ///
 /// The "found" version for each package comes from its own
 /// `dependencies` map. Resolve that edge to the provider's manifest version
@@ -66,7 +71,7 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
                 found_tail.map(|tail| peer_provider(graph, peer_name, tail).version);
 
             let satisfied = match &found_version {
-                Some(v) => version_satisfies(v, declared_range),
+                Some(v) => crate::peer_semver::declared_peer_version_satisfies(v, declared_range),
                 None => false,
             };
             if satisfied {
@@ -76,6 +81,8 @@ pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
             unmet.push(UnmetPeer {
                 from_dep_path: pkg.dep_path.clone(),
                 from_name: pkg.name.clone(),
+                from_registry_name: pkg.registry_name().to_string(),
+                from_version: pkg.version.clone(),
                 peer_name: peer_name.clone(),
                 declared: declared_range.clone(),
                 found: found_version,
