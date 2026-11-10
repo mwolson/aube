@@ -53,7 +53,7 @@ pub use control::{
 };
 pub use dep_selection::DepSelection;
 pub(super) use fetch::fetch_packages;
-use fetch::{fetch_packages_with_root, import_local_source, version_from_dep_path};
+use fetch::{fetch_packages_with_root, import_local_source};
 pub use frozen::{FrozenMode, FrozenOverride, GlobalVirtualStoreFlags};
 pub(crate) use gvs::detect_existing_global_virtual_store;
 use index_remap::{remap_indices_to_contextualized, strip_peer_context_suffix};
@@ -2369,7 +2369,14 @@ async fn run_inner(mut opts: InstallOptions, cwd: std::path::PathBuf) -> miette:
     //     silent default path.
     if resolve_strict_peer_dependencies(&settings_ctx) {
         let peer_rules = PeerDependencyRules::resolve(&manifest, &settings_ctx);
-        check_unmet_peers(&graph, &peer_rules)?;
+        let linked_peers = settings::linked_peer_packages(
+            &graph,
+            &cwd,
+            &manifests,
+            settings::resolve_peers_from_workspace_root(&settings_ctx),
+            &workspace_catalogs,
+        );
+        check_unmet_peers(&graph, &peer_rules, &linked_peers)?;
     }
 
     // 5b. Apply --prod / --dev / --no-optional filters. Drops the corresponding

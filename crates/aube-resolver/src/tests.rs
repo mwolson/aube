@@ -3723,6 +3723,24 @@ fn hoist_auto_installed_peers_leaves_already_satisfied_peers_alone() {
     assert_eq!(react_dep.specifier.as_deref(), Some("17.0.2"));
 }
 
+fn peer_test_importers(
+    packages: &BTreeMap<String, LockedPackage>,
+) -> BTreeMap<String, Vec<DirectDep>> {
+    [(
+        ".".into(),
+        packages
+            .values()
+            .map(|pkg| DirectDep {
+                name: pkg.name.clone(),
+                dep_path: pkg.dep_path.clone(),
+                dep_type: DepType::Production,
+                specifier: None,
+            })
+            .collect(),
+    )]
+    .into()
+}
+
 // `detect_unmet_peers` should flag a package whose declared peer
 // range isn't satisfied by whatever the graph ends up providing.
 // This is the core case: user pins `react@15.7.0`, a consumer
@@ -3742,7 +3760,7 @@ fn detect_unmet_peers_flags_version_mismatch() {
     packages.insert(consumer.dep_path.clone(), consumer);
 
     let graph = LockfileGraph {
-        importers: BTreeMap::new(),
+        importers: peer_test_importers(&packages),
         packages,
         ..Default::default()
     };
@@ -3772,11 +3790,267 @@ fn detect_unmet_peers_silent_when_satisfied() {
     packages.insert(consumer.dep_path.clone(), consumer);
 
     let graph = LockfileGraph {
-        importers: BTreeMap::new(),
+        importers: peer_test_importers(&packages),
         packages,
         ..Default::default()
     };
     assert!(detect_unmet_peers(&graph).is_empty());
+}
+
+#[test]
+fn detect_unmet_peers_matches_pnpm_install_pipeline() {
+    // Each row was checked with fresh strict pnpm 12.14.0 local-tarball installs,
+    // both alone and with a second peer that triggers importer inspection.
+    for (version, range, satisfied, reported_when_triggered) in [
+        ("19.3.0-canary-x", "^19.0.0", true, false),
+        ("19.0.0-rc.1", "^19.0.0", true, true),
+        ("2.0.0-beta.1", ">=2.0.0", true, true),
+        ("5.0.0-t3.48", ">=4.0.0", true, false),
+        ("5.0.0-t3.48", ">= 4.0.0", true, true),
+        ("19.3.0-canary-x", "*", true, false),
+        ("19.3.0-canary-x", "  ", true, false),
+        ("20.0.0-beta.1", "^19.0.0", false, true),
+        ("20.0.0-beta.1", "<20.0.0", true, false),
+        ("19.0.0-rc.1", ">=18.0.0 <19.0.0", true, false),
+        ("20.0.0", ">=18.0.0 <19.0.0", false, true),
+        ("19.3.0-canary-x", "^18.0.0 || ^19.0.0", true, false),
+        ("1.9.5-beta", "~1.9.0", true, false),
+        ("2.0.0-beta", "~1.9.0", false, true),
+        ("1.0.0-beta", "1", true, true),
+        ("1.2.9-beta", "<=1.2", true, false),
+        ("1.2.9", "<=1.2", true, false),
+        ("1.9.0", "<=1", true, false),
+        ("1.3.0", "<=1.2", false, true),
+        ("1.3.0-beta", "<=1.2", false, true),
+        ("1.0.0-beta", "<1", false, true),
+        ("1.5.0-beta", "1.0.0 - 1.9.0", true, false),
+        ("custom-tag", "custom-tag", true, false),
+        ("custom-tag", "*", true, false),
+        ("custom-tag", "^19.0.0", false, true),
+        ("19.0.0", "not-a-range", true, false),
+        ("6.0.6", "^5.0.2", false, true),
+        ("19.0.0-rc.1", "workspace:^19", true, true),
+        ("19.0.0-rc.1", "workspace:^", true, false),
+        ("19.0.0-rc.1", "npm:react@^19", true, true),
+        ("19.0.0-rc.1", "work:^18 || work:^19", true, true),
+        ("19.0.0", "work:^18", false, true),
+        ("19.0.0", "file:../react", true, false),
+        ("19.0.0", "<=*", true, false),
+        ("19.0.0", "<=x", true, false),
+        ("19.0.0", "<= *", true, false),
+        ("19.0.0-rc.1", ">= 18.0.0 < 19.0.0", false, true),
+        ("20.0.0-beta.1", "< 20.0.0", false, true),
+        ("18.5.0", ">= 18.0.0 < 19.0.0", true, false),
+        ("19.0.0", "< 20.0.0", true, false),
+    ] {
+        let consumer = mk_locked(
+            "consumer",
+            "1.0.0",
+            &[("react", version)],
+            &[("react", range)],
+        );
+        let provider = mk_locked("react", version, &[], &[]);
+        let mut graph = LockfileGraph {
+            packages: [consumer, provider]
+                .into_iter()
+                .map(|pkg| (pkg.dep_path.clone(), pkg))
+                .collect(),
+            ..Default::default()
+        };
+        graph.importers = peer_test_importers(&graph.packages);
+        assert_eq!(
+            detect_unmet_peers(&graph).is_empty(),
+            satisfied,
+            "{version} against {range}"
+        );
+        let trigger = mk_locked("trigger", "2.0.0", &[], &[]);
+        let triggerer = mk_locked(
+            "triggerer",
+            "1.0.0",
+            &[("trigger", "2.0.0")],
+            &[("trigger", "^1")],
+        );
+        for pkg in [trigger, triggerer] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        graph.importers = peer_test_importers(&graph.packages);
+        let unmet = detect_unmet_peers(&graph);
+        assert!(unmet.iter().any(|issue| issue.peer_name == "trigger"));
+        assert_eq!(
+            unmet.iter().any(|issue| issue.peer_name == "react"),
+            reported_when_triggered,
+            "triggered report: {version} against {range}"
+        );
+    }
+}
+
+#[test]
+fn detect_unmet_peers_limits_inspection_to_flagged_importers() {
+    let packages = [
+        mk_locked(
+            "consumer",
+            "1.0.0",
+            &[("react", "19.0.0-rc.1")],
+            &[("react", "^19")],
+        ),
+        mk_locked("react", "19.0.0-rc.1", &[], &[]),
+        mk_locked(
+            "triggerer",
+            "1.0.0",
+            &[("trigger", "2.0.0")],
+            &[("trigger", "^1")],
+        ),
+        mk_locked("trigger", "2.0.0", &[], &[]),
+    ];
+    let mut graph = LockfileGraph {
+        packages: packages
+            .into_iter()
+            .map(|pkg| (pkg.dep_path.clone(), pkg))
+            .collect(),
+        ..Default::default()
+    };
+    for (importer, name) in [("packages/a", "triggerer"), ("packages/b", "consumer")] {
+        graph.importers.insert(
+            importer.into(),
+            vec![aube_lockfile::DirectDep {
+                name: name.into(),
+                dep_path: format!("{name}@1.0.0"),
+                dep_type: aube_lockfile::DepType::Production,
+                specifier: Some("1.0.0".into()),
+            }],
+        );
+    }
+    // pnpm reports only the flagged importer, even when a rule later waives
+    // its trigger. The clean importer's prerelease mismatch is not inspected.
+    let unmet = detect_unmet_peers(&graph);
+    assert_eq!(
+        unmet
+            .iter()
+            .map(|issue| issue.peer_name.as_str())
+            .collect::<Vec<_>>(),
+        ["trigger"]
+    );
+
+    let consumer = graph.importers.remove("packages/b").unwrap();
+    graph
+        .importers
+        .get_mut("packages/a")
+        .unwrap()
+        .extend(consumer);
+    let unmet = detect_unmet_peers(&graph);
+    assert_eq!(
+        unmet
+            .iter()
+            .map(|issue| issue.peer_name.as_str())
+            .collect::<Vec<_>>(),
+        ["react", "trigger"]
+    );
+}
+
+#[test]
+fn detect_unmet_peers_attributes_shared_contexts_to_first_importer() {
+    for first_has_react in [false, true] {
+        for separate_context in [false, true] {
+            let mut graph = LockfileGraph::default();
+            for pkg in [
+                mk_locked(
+                    "consumer",
+                    "1.0.0",
+                    &[("react", "19.0.0-rc.1")],
+                    &[("react", "^19")],
+                ),
+                mk_locked(
+                    "triggerer",
+                    "1.0.0",
+                    &[("trigger", "2.0.0")],
+                    &[("trigger", "^1")],
+                ),
+            ] {
+                graph.packages.insert(pkg.dep_path.clone(), pkg);
+            }
+            let mut second = graph.packages["triggerer@1.0.0"].clone();
+            second.dep_path += "(trigger@3.0.0)";
+            second.dependencies.insert("trigger".into(), "3.0.0".into());
+            let second_key = second.dep_path.clone();
+            graph.packages.insert(second_key.clone(), second);
+            let direct = |name: &str, key: &str| DirectDep {
+                name: name.into(),
+                dep_path: key.into(),
+                dep_type: DepType::Production,
+                specifier: None,
+            };
+            for (id, has_react, trigger_key) in [
+                ("packages/a", first_has_react, "triggerer@1.0.0"),
+                (
+                    "packages/b",
+                    !first_has_react,
+                    if separate_context {
+                        &second_key
+                    } else {
+                        "triggerer@1.0.0"
+                    },
+                ),
+            ] {
+                let mut deps = vec![direct("triggerer", trigger_key)];
+                if has_react {
+                    deps.push(direct("consumer", "consumer@1.0.0"));
+                }
+                graph.importers.insert(id.into(), deps);
+            }
+            let issues = detect_unmet_peers(&graph);
+            assert_eq!(
+                issues.iter().any(|issue| issue.peer_name == "react"),
+                first_has_react || separate_context
+            );
+            assert_eq!(
+                issues
+                    .iter()
+                    .filter(|issue| issue.peer_name == "trigger")
+                    .count(),
+                if separate_context { 2 } else { 1 }
+            );
+        }
+    }
+}
+
+#[test]
+fn detect_unmet_peers_optional_missing_triggers_importer_inspection() {
+    let consumer = mk_locked(
+        "consumer",
+        "1.0.0",
+        &[("react", "19.0.0-rc.1")],
+        &[("react", "^19")],
+    );
+    let mut optional = mk_locked("opt", "1.0.0", &[], &[("absent", "^1")]);
+    optional.peer_dependencies_meta.insert(
+        "absent".into(),
+        aube_lockfile::PeerDepMeta { optional: true },
+    );
+    let mut graph = LockfileGraph::default();
+    for pkg in [consumer, optional] {
+        graph.packages.insert(pkg.dep_path.clone(), pkg);
+    }
+    graph.importers = peer_test_importers(&graph.packages);
+    let issues = detect_unmet_peers(&graph);
+    assert_eq!(
+        issues
+            .iter()
+            .map(|issue| issue.peer_name.as_str())
+            .collect::<Vec<_>>(),
+        ["react"]
+    );
+}
+
+#[test]
+fn detect_unmet_peers_requires_importer_roots() {
+    let pkg = mk_locked("consumer", "1.0.0", &[], &[("missing", "*")]);
+    let mut graph = LockfileGraph {
+        packages: [(pkg.dep_path.clone(), pkg)].into(),
+        ..Default::default()
+    };
+    assert!(detect_unmet_peers(&graph).is_empty());
+    graph.importers = peer_test_importers(&graph.packages);
+    assert_eq!(detect_unmet_peers(&graph).len(), 1);
 }
 
 // Peer declared but completely absent from `pkg.dependencies` —
@@ -3793,7 +4067,7 @@ fn detect_unmet_peers_flags_completely_missing_peer() {
     packages.insert(consumer.dep_path.clone(), consumer);
 
     let graph = LockfileGraph {
-        importers: BTreeMap::new(),
+        importers: peer_test_importers(&packages),
         packages,
         ..Default::default()
     };
@@ -3825,7 +4099,7 @@ fn detect_unmet_peers_reports_provided_optional_peer_mismatches() {
     packages.insert(consumer.dep_path.clone(), consumer);
 
     let graph = LockfileGraph {
-        importers: BTreeMap::new(),
+        importers: peer_test_importers(&packages),
         packages,
         ..Default::default()
     };
@@ -3901,6 +4175,7 @@ fn strict_optional_peers_validate_source_manifest_versions() {
         let mut graph = LockfileGraph::default();
         graph.packages.insert(provider.dep_path.clone(), provider);
         graph.packages.insert(consumer.dep_path.clone(), consumer);
+        graph.importers = peer_test_importers(&graph.packages);
         assert!(
             detect_unmet_peers(&graph).is_empty(),
             "compatible {tail}: {:?}",

@@ -1,4 +1,3 @@
-use super::version_from_dep_path;
 use miette::{Context, IntoDiagnostic, miette};
 use std::collections::BTreeMap;
 
@@ -1388,10 +1387,13 @@ pub(crate) fn configure_resolver(
 pub(super) fn check_unmet_peers(
     graph: &aube_lockfile::LockfileGraph,
     rules: &PeerDependencyRules,
+    linked_peers: &BTreeMap<String, Vec<aube_lockfile::LockedPackage>>,
 ) -> miette::Result<()> {
-    let unmet: Vec<_> = aube_resolver::detect_unmet_peers(graph)
+    let mut reported = std::collections::BTreeSet::new();
+    let unmet: Vec<_> = aube_resolver::detect_unmet_peers_with_links(graph, linked_peers)
         .into_iter()
         .filter(|u| !rules.silences(u))
+        .filter(|u| reported.insert(format_unmet_peer(u)))
         .collect();
     if unmet.is_empty() {
         return Ok(());
@@ -1402,17 +1404,7 @@ pub(super) fn check_unmet_peers(
         "Issues with peer dependencies found",
     );
     for u in &unmet {
-        let from_ver = version_from_dep_path(&u.from_dep_path, &u.from_name);
-        let msg = match &u.found {
-            Some(found) => format!(
-                "  {}@{from_ver}: expected peer {}@{}, found {found}",
-                u.from_name, u.peer_name, u.declared,
-            ),
-            None => format!(
-                "  {}@{from_ver}: missing required peer {}@{}",
-                u.from_name, u.peer_name, u.declared,
-            ),
-        };
+        let msg = format_unmet_peer(u);
         super::control::output(super::InstallOutputLevel::Error, None, msg);
     }
     Err(miette!(
@@ -1422,6 +1414,176 @@ pub(super) fn check_unmet_peers(
         unmet.len(),
         if unmet.len() == 1 { "y" } else { "ies" }
     ))
+}
+
+fn format_unmet_peer(u: &aube_resolver::UnmetPeer) -> String {
+    let from_ver = &u.from_version;
+    match &u.found {
+        Some(found) => format!(
+            "  {}@{from_ver}: expected peer {}@{}, found {found}",
+            u.from_name, u.peer_name, u.declared,
+        ),
+        None => format!(
+            "  {}@{from_ver}: missing required peer {}@{}",
+            u.from_name, u.peer_name, u.declared,
+        ),
+    }
+}
+
+/// Build inspection-only snapshots for linked projects. Consumer providers take
+/// precedence over the linked project's own dependencies and then the root.
+pub(super) fn linked_peer_packages(
+    graph: &aube_lockfile::LockfileGraph,
+    cwd: &std::path::Path,
+    manifests: &[(String, aube_manifest::PackageJson)],
+    resolve_from_root: bool,
+    catalogs: &BTreeMap<String, BTreeMap<String, String>>,
+) -> BTreeMap<String, Vec<aube_lockfile::LockedPackage>> {
+    let mut linked = BTreeMap::<String, Vec<aube_lockfile::LockedPackage>>::new();
+    let projects: BTreeMap<_, _> = manifests.iter().map(|(id, m)| (id.as_str(), m)).collect();
+    let names: BTreeMap<_, _> = manifests
+        .iter()
+        .filter_map(|(id, m)| Some((m.name.as_deref()?, id.as_str())))
+        .collect();
+    for (id, manifest) in manifests {
+        // Frozen checks must use the lockfile's importer roots as well.
+        let Some(consumer) = graph.importers.get(id) else {
+            continue;
+        };
+        for (alias, spec) in manifest.all_dependencies().chain(
+            manifest
+                .optional_dependencies
+                .iter()
+                .map(|(n, s)| (n.as_str(), s.as_str())),
+        ) {
+            let workspace = spec.strip_prefix("workspace:");
+            let target_id = if let Some(workspace) = workspace {
+                let name = workspace.rsplit_once('@').map_or(alias, |(name, _)| name);
+                names.get(name).copied().map(str::to_string)
+            } else if let Some(relative) = spec.strip_prefix("link:").or_else(|| {
+                spec.strip_prefix("file:").filter(|p| {
+                    !p.ends_with(".tgz") && !p.ends_with(".tar.gz") && !p.ends_with(".tar")
+                })
+            }) {
+                let target =
+                    aube_util::path::normalize_lexical(&std::path::Path::new(id).join(relative));
+                let target = if target.is_absolute() {
+                    pathdiff::diff_paths(&target, cwd).unwrap_or(target)
+                } else {
+                    target
+                };
+                Some(if target.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    target.to_string_lossy().replace('\\', "/")
+                })
+            } else {
+                continue;
+            };
+            let target = target_id
+                .as_deref()
+                .and_then(|id| projects.get(id).copied());
+            if target.is_some_and(|m| m.peer_dependencies.is_empty()) {
+                continue;
+            }
+            let snapshots = linked.entry(id.clone()).or_default();
+            let Some(target_id) = target_id else { continue };
+            // Unknown directory targets may still be inside the workspace.
+            let read_manifest;
+            let target = if let Some(target) = target {
+                target
+            } else {
+                let Ok(root) = cwd.canonicalize() else {
+                    continue;
+                };
+                let Ok(dir) = cwd.join(&target_id).canonicalize() else {
+                    continue;
+                };
+                if !dir.starts_with(&root) {
+                    continue;
+                }
+                let Ok(manifest) = aube_manifest::PackageJson::from_path(&dir.join("package.json"))
+                else {
+                    continue;
+                };
+                read_manifest = manifest;
+                &read_manifest
+            };
+            let Some(dep) = consumer.iter().find(|dep| dep.name == alias) else {
+                continue;
+            };
+            // file: directories have their own package snapshots. pnpm's
+            // check_link only adds the separate check for actual links.
+            if spec.starts_with("file:")
+                && graph.packages.get(&dep.dep_path).is_some_and(|pkg| {
+                    !matches!(pkg.local_source, Some(aube_lockfile::LocalSource::Link(_)))
+                })
+            {
+                continue;
+            }
+            let mut pkg = aube_lockfile::LockedPackage {
+                name: alias.to_string(),
+                version: target.version.clone().unwrap_or_else(|| "0.0.0".into()),
+                dep_path: format!("{alias}@link:{target_id}"),
+                peer_dependencies: target.peer_dependencies.clone(),
+                ..Default::default()
+            };
+            for name in target.peer_dependencies.keys() {
+                pkg.peer_dependencies_meta.insert(
+                    name.clone(),
+                    aube_lockfile::PeerDepMeta {
+                        optional: target.peer_dependency_is_optional(name),
+                    },
+                );
+                let provider = consumer
+                    .iter()
+                    .find(|dep| &dep.name == name)
+                    .or_else(|| {
+                        graph
+                            .importers
+                            .get(&target_id)?
+                            .iter()
+                            .find(|dep| &dep.name == name)
+                    })
+                    .or_else(|| {
+                        resolve_from_root
+                            .then(|| graph.root_deps().iter().find(|dep| &dep.name == name))
+                            .flatten()
+                    });
+                if let Some(provider) = provider {
+                    let version = if graph.packages.contains_key(&provider.dep_path) {
+                        provider.dep_path.clone()
+                    } else if let Some(project) =
+                        names.get(name.as_str()).and_then(|id| projects.get(id))
+                    {
+                        project.version.clone().unwrap_or_else(|| "0.0.0".into())
+                    } else {
+                        provider
+                            .dep_path
+                            .strip_prefix(&format!("{name}@"))
+                            .unwrap_or(&provider.dep_path)
+                            .to_string()
+                    };
+                    pkg.dependencies.insert(name.clone(), version);
+                }
+            }
+            for (name, range) in &mut pkg.peer_dependencies {
+                if let Some(catalog) = range.strip_prefix("catalog:")
+                    && let Some(resolved) = catalogs
+                        .get(if catalog.is_empty() {
+                            "default"
+                        } else {
+                            catalog
+                        })
+                        .and_then(|entries| entries.get(name))
+                {
+                    *range = resolved.clone();
+                }
+            }
+            snapshots.push(pkg);
+        }
+    }
+    linked
 }
 
 /// Resolved `pnpm.peerDependencyRules` — the three escape hatches pnpm
@@ -1442,7 +1604,7 @@ pub(crate) struct PeerDependencyRules {
     ignore_missing: Vec<glob::Pattern>,
     allow_any: Vec<glob::Pattern>,
     /// Keys are pnpm selectors: either a bare peer name (`react`) or a
-    /// scoped `parent>peer` pair (`styled-components>react`). Values are
+    /// `parent[@range]>peer` pair (`ws@7>utf-8-validate`). Values are
     /// additional semver ranges; a peer resolving inside *either* the
     /// declared range or this override is treated as satisfied.
     allowed_versions: BTreeMap<String, String>,
@@ -1490,33 +1652,42 @@ impl PeerDependencyRules {
             return true;
         }
         if let Some(found) = u.found.as_deref()
-            && self.allowed_versions_permit(&u.from_name, &u.peer_name, found)
+            && self.allowed_versions_permit(u, found)
         {
             return true;
         }
         false
     }
 
-    fn allowed_versions_permit(&self, parent: &str, peer: &str, found: &str) -> bool {
-        let scoped_key = format!("{parent}>{peer}");
-        let candidates = [
-            self.allowed_versions.get(&scoped_key),
-            self.allowed_versions.get(peer),
-        ];
-        let Ok(found_v) = node_semver::Version::parse(found) else {
-            return false;
-        };
-        candidates
-            .into_iter()
-            .flatten()
-            .any(|range| matches_range(range, &found_v))
+    fn allowed_versions_permit(&self, u: &aube_resolver::UnmetPeer, found: &str) -> bool {
+        self.allowed_versions.iter().any(|(selector, ranges)| {
+            let target = if let Some((parent, target)) = selector.split_once('>') {
+                let (parent, range) = peer_rule_selector(parent.trim());
+                if parent != u.from_registry_name
+                    || range.is_some_and(|range| {
+                        !aube_resolver::peer_version_satisfies(&u.from_version, range)
+                    })
+                {
+                    return false;
+                }
+                target.trim()
+            } else {
+                selector.as_str()
+            };
+            let (peer, _) = peer_rule_selector(target);
+            peer == u.peer_name
+                && ranges
+                    .split("||")
+                    .any(|range| aube_resolver::peer_version_satisfies(found, range.trim()))
+        })
     }
 }
 
-fn matches_range(range: &str, found: &node_semver::Version) -> bool {
-    match node_semver::Range::parse(range) {
-        Ok(r) => r.satisfies(found),
-        Err(_) => false,
+fn peer_rule_selector(selector: &str) -> (&str, Option<&str>) {
+    // Skip the leading scope marker when looking for a version delimiter.
+    match selector.char_indices().skip(1).find(|(_, c)| *c == '@') {
+        Some((at, _)) => (&selector[..at], Some(&selector[at + 1..])),
+        None => (selector, None),
     }
 }
 
@@ -1702,6 +1873,8 @@ mod peer_dependency_rules_tests {
         aube_resolver::UnmetPeer {
             from_dep_path: format!("{parent}@0.0.0"),
             from_name: parent.to_string(),
+            from_registry_name: parent.to_string(),
+            from_version: "0.0.0".to_string(),
             peer_name: peer.to_string(),
             declared: declared.to_string(),
             found: found.map(String::from),
@@ -1775,6 +1948,511 @@ mod peer_dependency_rules_tests {
         )));
         // Different parent — not silenced.
         assert!(!r.silences(&unmet("other-lib", "react", "^18.0.0", Some("19.0.0"))));
+    }
+
+    #[test]
+    fn allowed_versions_versioned_parent_checks_declaring_version() {
+        let r = rules(&[], &[], &[("ws@7>utf-8-validate", "6")]);
+        let mut u = unmet("ws", "utf-8-validate", "^5.0.2", Some("6.0.6"));
+        u.from_version = "7.5.11".to_string();
+        assert!(r.silences(&u));
+        u.from_version = "8.0.0".to_string();
+        assert!(!r.silences(&u));
+    }
+
+    #[test]
+    fn allowed_versions_scoped_parent_admits_prerelease_with_star() {
+        let r = rules(
+            &[],
+            &[],
+            &[("@react-navigation/native-stack@7>react-native-screens", "*")],
+        );
+        let mut u = unmet(
+            "@react-navigation/native-stack",
+            "react-native-screens",
+            ">=4.0.0",
+            Some("5.0.0-t3.48"),
+        );
+        u.from_version = "7.8.0".to_string();
+        assert!(r.silences(&u));
+        u.from_registry_name = "other-stack".to_string();
+        assert!(!r.silences(&u));
+    }
+
+    #[test]
+    fn allowed_versions_bare_version_selectors_and_parent_rules_accumulate() {
+        let r = rules(
+            &[],
+            &[],
+            &[
+                ("react@18", "^19.0.0 || 20"),
+                ("parent@1>react@18", "21"),
+                ("parent@1>react", "22"),
+            ],
+        );
+        for found in ["19.3.0-canary-x", "20.1.0", "21.0.0", "22.0.0"] {
+            let mut u = unmet("parent", "react", "^18", Some(found));
+            u.from_version = "1.0.0".to_string();
+            assert!(r.silences(&u), "{found}");
+        }
+        assert!(!r.silences(&unmet("parent", "react", "^18", Some("23.0.0"))));
+        assert!(!r.silences(&unmet("parent", "react", "^18", Some("19.0.0-rc.1"))));
+    }
+
+    #[test]
+    fn allowed_versions_empty_pieces_do_not_widen_rules() {
+        let u = unmet("ws", "utf-8-validate", "^5.0.2", Some("6.0.6"));
+        for (selector, value, silenced) in [
+            ("utf-8-validate", "5 ||", false),
+            ("utf-8-validate", " || 5", false),
+            ("utf-8-validate", "", false),
+            ("utf-8-validate", "  ", false),
+            ("utf-8-validate", "5 || || 6", true),
+            ("ws@>utf-8-validate", "6", false),
+            (" ws > utf-8-validate ", "6", true),
+        ] {
+            assert_eq!(
+                rules(&[], &[], &[(selector, value)]).silences(&u),
+                silenced,
+                "{selector}: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_versions_t3_scoped_parent_uses_pnpm_spaced_rule_value() {
+        let u = unmet(
+            "@react-navigation/native-stack",
+            "react-native-screens",
+            ">= 4.0.0",
+            Some("5.0.0-t3.48"),
+        );
+        for (value, silenced) in [("*", true), (">= 4.0.0", false)] {
+            let r = rules(
+                &[],
+                &[],
+                &[("@react-navigation/native-stack>react-native-screens", value)],
+            );
+            assert_eq!(r.silences(&u), silenced, "{value}");
+        }
+    }
+
+    #[test]
+    fn allowed_versions_and_parent_ranges_use_pnpm_spaced_intervals() {
+        // Verified with fresh strict pnpm 12.14.0 local-tarball installs.
+        for (version, range, silenced) in [
+            ("20.0.0-beta.1", "< 20.0.0", false),
+            ("20.0.0-beta.1", "<20.0.0", true),
+            ("19.0.0", "< 20.0.0", true),
+            ("19.0.0", "<20.0.0", true),
+            ("19.0.0", "<=*", true),
+            ("19.0.0", "<=x", true),
+            ("19.0.0", "<= *", true),
+        ] {
+            let mut u = unmet("consumer", "react", "^1", Some(version));
+            assert_eq!(
+                rules(&[], &[], &[("react", range)]).silences(&u),
+                silenced,
+                "value {version} against {range}"
+            );
+            u.from_version = version.into();
+            u.found = Some("2.0.0".into());
+            let selector = format!("consumer@{range}>react");
+            assert_eq!(
+                rules(&[], &[], &[(selector.as_str(), "*")]).silences(&u),
+                silenced,
+                "parent {version} against {range}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_rules_filter_after_importer_inspection() {
+        let packages = [
+            aube_lockfile::LockedPackage {
+                name: "consumer".into(),
+                version: "1.0.0".into(),
+                dep_path: "consumer@1.0.0".into(),
+                dependencies: [("react".into(), "19.0.0-rc.1".into())].into(),
+                peer_dependencies: [("react".into(), "^19.0.0".into())].into(),
+                ..Default::default()
+            },
+            aube_lockfile::LockedPackage {
+                name: "triggerer".into(),
+                version: "1.0.0".into(),
+                dep_path: "triggerer@1.0.0".into(),
+                dependencies: [("trigger".into(), "2.0.0".into())].into(),
+                peer_dependencies: [("trigger".into(), "^1".into())].into(),
+                ..Default::default()
+            },
+        ];
+        let mut graph = aube_lockfile::LockfileGraph {
+            packages: packages
+                .into_iter()
+                .map(|pkg| (pkg.dep_path.clone(), pkg))
+                .collect(),
+            ..Default::default()
+        };
+        graph.importers.insert(
+            ".".into(),
+            graph
+                .packages
+                .values()
+                .map(|pkg| aube_lockfile::DirectDep {
+                    name: pkg.name.clone(),
+                    dep_path: pkg.dep_path.clone(),
+                    dep_type: aube_lockfile::DepType::Production,
+                    specifier: None,
+                })
+                .collect(),
+        );
+        for (allow_any, allowed_versions, expected) in [
+            (vec![], vec![], vec!["react", "trigger"]),
+            (vec![], vec![("trigger", "*")], vec!["react"]),
+            (vec![], vec![("react", "*")], vec!["trigger"]),
+            (vec![], vec![("react", "*"), ("trigger", "*")], vec![]),
+            (vec!["react"], vec![], vec!["trigger"]),
+            (vec!["react", "trigger"], vec![], vec![]),
+        ] {
+            let r = rules(&[], &allow_any, &allowed_versions);
+            let unmet = aube_resolver::detect_unmet_peers(&graph);
+            let peers: Vec<_> = unmet
+                .iter()
+                .filter(|issue| !r.silences(issue))
+                .map(|issue| issue.peer_name.as_str())
+                .collect();
+            assert_eq!(peers, expected);
+            assert_eq!(
+                check_unmet_peers(&graph, &r, &BTreeMap::new()).is_ok(),
+                expected.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_versions_uses_real_parent_name_and_manifest_version() {
+        let r = rules(&[], &[], &[("ws@7>utf-8-validate", "6")]);
+        for (name, alias_of, dep_path) in [
+            ("ws7", Some("ws"), "ws7@npm:ws@7.5.11"),
+            ("ws", None, "ws@file:../ws"),
+            ("ws", None, "ws@link:../ws"),
+            ("ws", None, "ws@git+https://example.com/ws.git#abc"),
+            ("ws", None, "ws@https://example.com/ws.tgz"),
+        ] {
+            let parent = aube_lockfile::LockedPackage {
+                name: name.into(),
+                alias_of: alias_of.map(String::from),
+                version: "7.5.11".into(),
+                dep_path: dep_path.into(),
+                dependencies: [("utf-8-validate".into(), "6.0.6".into())].into(),
+                peer_dependencies: [("utf-8-validate".into(), "^5.0.2".into())].into(),
+                ..Default::default()
+            };
+            let graph = aube_lockfile::LockfileGraph {
+                importers: [(
+                    ".".into(),
+                    vec![aube_lockfile::DirectDep {
+                        name: name.into(),
+                        dep_path: dep_path.into(),
+                        dep_type: aube_lockfile::DepType::Production,
+                        specifier: None,
+                    }],
+                )]
+                .into(),
+                packages: [(dep_path.into(), parent)].into(),
+                ..Default::default()
+            };
+            let unmet = aube_resolver::detect_unmet_peers(&graph);
+            assert_eq!(unmet.len(), 1, "{dep_path}");
+            assert_eq!(unmet[0].from_name, name);
+            assert_eq!(unmet[0].from_registry_name, "ws");
+            assert_eq!(unmet[0].from_version, "7.5.11");
+            assert_eq!(
+                format_unmet_peer(&unmet[0]),
+                format!("  {name}@7.5.11: expected peer utf-8-validate@^5.0.2, found 6.0.6")
+            );
+            assert!(r.silences(&unmet[0]), "{dep_path}");
+            if alias_of.is_some() {
+                assert!(!rules(&[], &[], &[("ws7>utf-8-validate", "6")]).silences(&unmet[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn peer_rules_keep_missing_and_wrong_version_filters_separate() {
+        for (peer, found) in [("absent", None), ("react", Some("2.0.0"))] {
+            let parent = aube_lockfile::LockedPackage {
+                name: "consumer".into(),
+                version: "1.0.0".into(),
+                dep_path: "consumer@1.0.0".into(),
+                peer_dependencies: [(peer.into(), "^1".into())].into(),
+                dependencies: found
+                    .map(|version| (peer.into(), version.into()))
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let graph = aube_lockfile::LockfileGraph {
+                importers: [(
+                    ".".into(),
+                    vec![aube_lockfile::DirectDep {
+                        name: "consumer".into(),
+                        dep_path: parent.dep_path.clone(),
+                        dep_type: aube_lockfile::DepType::Production,
+                        specifier: None,
+                    }],
+                )]
+                .into(),
+                packages: [(parent.dep_path.clone(), parent)].into(),
+                ..Default::default()
+            };
+            let issues = aube_resolver::detect_unmet_peers(&graph);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(
+                rules(&[peer], &[], &[]).silences(&issues[0]),
+                found.is_none()
+            );
+            assert!(rules(&[], &[peer], &[]).silences(&issues[0]));
+            assert_eq!(
+                rules(&[], &[], &[(peer, "*")]).silences(&issues[0]),
+                found.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn linked_consumers_trigger_inspection_and_check_own_peers() {
+        for spec in ["workspace:*", "link:../lib", "file:../lib"] {
+            for provided in [None, Some("18.0.0"), Some("19.0.0")] {
+                let lib: aube_manifest::PackageJson = serde_json::from_value(serde_json::json!({
+                    "name":"lib", "version":"1.0.0", "peerDependencies":{"react":"^18"}
+                }))
+                .unwrap();
+                let app: aube_manifest::PackageJson = serde_json::from_value(serde_json::json!({
+                    "name":"app", "dependencies":{"lib":spec}
+                }))
+                .unwrap();
+                let consumer = aube_lockfile::LockedPackage {
+                    name: "consumer".into(),
+                    version: "1.0.0".into(),
+                    dep_path: "consumer@1.0.0".into(),
+                    dependencies: [("rc".into(), "19.0.0-rc.1".into())].into(),
+                    peer_dependencies: [("rc".into(), "^19".into())].into(),
+                    ..Default::default()
+                };
+                let direct = |name: &str, key: &str| aube_lockfile::DirectDep {
+                    name: name.into(),
+                    dep_path: key.into(),
+                    dep_type: aube_lockfile::DepType::Production,
+                    specifier: None,
+                };
+                let mut deps = vec![
+                    direct("lib", "lib@1.0.0"),
+                    direct("consumer", &consumer.dep_path),
+                ];
+                if let Some(version) = provided {
+                    deps.push(direct("react", &format!("react@{version}")));
+                }
+                let mut graph = aube_lockfile::LockfileGraph {
+                    importers: [
+                        ("packages/app".into(), deps),
+                        ("packages/lib".into(), vec![]),
+                    ]
+                    .into(),
+                    packages: [(consumer.dep_path.clone(), consumer)].into(),
+                    ..Default::default()
+                };
+                graph.packages.insert(
+                    "lib@1.0.0".into(),
+                    aube_lockfile::LockedPackage {
+                        name: "lib".into(),
+                        dep_path: "lib@1.0.0".into(),
+                        local_source: Some(aube_lockfile::LocalSource::Link("packages/lib".into())),
+                        ..Default::default()
+                    },
+                );
+                let manifests = vec![("packages/app".into(), app), ("packages/lib".into(), lib)];
+                let linked = linked_peer_packages(
+                    &graph,
+                    std::path::Path::new("/repo"),
+                    &manifests,
+                    true,
+                    &BTreeMap::new(),
+                );
+                assert!(linked.contains_key("packages/app"), "{spec}");
+                let issues = aube_resolver::detect_unmet_peers_with_links(&graph, &linked);
+                assert!(issues.iter().any(|issue| issue.peer_name == "rc"));
+                assert_eq!(
+                    issues.iter().any(|issue| issue.peer_name == "react"),
+                    provided != Some("18.0.0")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_peer_checks_hydrate_link_placeholder_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let manifests: Vec<(String, aube_manifest::PackageJson)> = [
+            (".", serde_json::json!({"name":"root"})),
+            (
+                "packages/app",
+                serde_json::json!({"name":"app", "dependencies":{
+                    "lib":"workspace:*", "theme":"workspace:*", "consumer":"1.0.0"
+                }}),
+            ),
+            (
+                "packages/lib",
+                serde_json::json!({"name":"lib", "version":"1.0.0",
+                "peerDependencies":{"theme":"^2"}}),
+            ),
+            (
+                "packages/theme",
+                serde_json::json!({"name":"theme", "version":"2.1.0"}),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, value)| {
+            std::fs::create_dir_all(root.join(id)).unwrap();
+            std::fs::write(root.join(id).join("package.json"), value.to_string()).unwrap();
+            (id.into(), serde_json::from_value(value).unwrap())
+        })
+        .collect();
+        let lockfile = r#"lockfileVersion: '9.0'
+importers:
+  .: {}
+  packages/app:
+    dependencies:
+      lib: {specifier: 'workspace:*', version: 'link:../lib'}
+      theme: {specifier: 'workspace:*', version: 'link:../theme'}
+      consumer: {specifier: '1.0.0', version: '1.0.0(theme@packages+theme)'}
+  packages/lib: {}
+  packages/theme: {}
+packages:
+  consumer@1.0.0:
+    peerDependencies:
+      theme: ^2
+snapshots:
+  consumer@1.0.0(theme@packages+theme):
+    dependencies:
+      theme: link:packages/theme
+"#;
+        for (filename, kind) in [
+            ("pnpm-lock.yaml", aube_lockfile::LockfileKind::Pnpm),
+            ("aube-lock.yaml", aube_lockfile::LockfileKind::Aube),
+        ] {
+            let path = root.join(filename);
+            std::fs::write(&path, lockfile).unwrap();
+            let raw = aube_lockfile::pnpm::parse(&path).unwrap();
+            let key = &raw.importers["packages/app"]
+                .iter()
+                .find(|dep| dep.name == "theme")
+                .unwrap()
+                .dep_path;
+            assert_eq!(raw.packages[key].version, "0.0.0");
+            let (graph, _) = aube_lockfile::parse_lockfile_with_project_root(
+                root,
+                root,
+                &manifests[0].1,
+                Default::default(),
+                Some(kind),
+            )
+            .unwrap();
+            assert_eq!(graph.packages[key].version, "2.1.0");
+            let linked = linked_peer_packages(&graph, root, &manifests, true, &BTreeMap::new());
+            assert_eq!(linked["packages/app"].len(), 1);
+            assert!(aube_resolver::detect_unmet_peers_with_links(&graph, &linked).is_empty());
+            let mut bad = graph.clone();
+            bad.packages.get_mut(key).unwrap().version = "3.0.0".into();
+            let issues = aube_resolver::detect_unmet_peers_with_links(&bad, &linked);
+            assert_eq!(issues.len(), 2);
+            assert!(
+                issues
+                    .iter()
+                    .all(|issue| issue.found.as_deref() == Some("3.0.0"))
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_peer_snapshot_survives_registry_name_version_collision() {
+        let lib: aube_manifest::PackageJson = serde_json::from_value(serde_json::json!({
+            "name":"lib", "version":"1.0.0", "peerDependencies":{"react":"^18"}
+        }))
+        .unwrap();
+        for spec in ["workspace:*", "link:../lib", "file:../lib"] {
+            let app = serde_json::from_value(serde_json::json!({
+                "name":"app", "dependencies":{"lib":spec}
+            }))
+            .unwrap();
+            let graph = aube_lockfile::LockfileGraph {
+                importers: [(
+                    "packages/app".into(),
+                    vec![aube_lockfile::DirectDep {
+                        name: "lib".into(),
+                        dep_path: "lib@1.0.0".into(),
+                        dep_type: aube_lockfile::DepType::Production,
+                        specifier: Some(spec.into()),
+                    }],
+                )]
+                .into(),
+                packages: [(
+                    "lib@1.0.0".into(),
+                    aube_lockfile::LockedPackage {
+                        name: "lib".into(),
+                        version: "1.0.0".into(),
+                        dep_path: "lib@1.0.0".into(),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            };
+            let manifests = vec![
+                ("packages/app".into(), app),
+                ("packages/lib".into(), lib.clone()),
+            ];
+            let linked = linked_peer_packages(
+                &graph,
+                std::path::Path::new("/repo"),
+                &manifests,
+                true,
+                &BTreeMap::new(),
+            );
+            let issues = aube_resolver::detect_unmet_peers_with_links(&graph, &linked);
+            assert_eq!(
+                issues.len(),
+                usize::from(!spec.starts_with("file:")),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_linked_issues_are_reported_once() {
+        let graph = aube_lockfile::LockfileGraph {
+            importers: [
+                ("packages/app".into(), vec![]),
+                ("packages/web".into(), vec![]),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let package = aube_lockfile::LockedPackage {
+            name: "lib".into(),
+            version: "1.0.0".into(),
+            dep_path: "lib@link:packages/lib".into(),
+            peer_dependencies: [("theme".into(), "^2".into())].into(),
+            ..Default::default()
+        };
+        let linked = [
+            ("packages/app".into(), vec![package.clone()]),
+            ("packages/web".into(), vec![package]),
+        ]
+        .into();
+        let error = check_unmet_peers(&graph, &rules(&[], &[], &[]), &linked).unwrap_err();
+        assert!(error.to_string().starts_with("1 unmet peer dependency"));
     }
 
     #[test]
