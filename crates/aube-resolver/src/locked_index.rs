@@ -62,7 +62,7 @@ impl<'a> LockedIndex<'a> {
         Self { by_name }
     }
 
-    fn bucket(&self, name: &str) -> &[&'a LockedPackage] {
+    pub(crate) fn bucket(&self, name: &str) -> &[&'a LockedPackage] {
         self.by_name
             .get(name)
             .map(SmallVec::as_slice)

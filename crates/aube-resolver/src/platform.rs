@@ -267,6 +267,13 @@ pub fn filter_graph(
         .map(|(dep_path, _)| dep_path.clone())
         .collect();
     for pkg in graph.packages.values_mut() {
+        pkg.record_pnpm_dependency_declarations(&pkg.optional_dependencies.clone(), ignored);
+        let active_optional_peers: FxHashSet<_> = pkg
+            .peer_dependencies_meta
+            .iter()
+            .filter(|(name, meta)| meta.optional && !pkg.pnpm_peer_is_shadowed(name))
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut removed = Vec::new();
         pkg.optional_dependencies.retain(|name, tail| {
             // Resolve through every reader convention (incl. the
@@ -278,7 +285,8 @@ pub fn filter_graph(
                     Some(child_key) => mismatched_packages.contains(&child_key),
                     None => false,
                 };
-            let keep = !ignored.contains(name) && !child_is_mismatched;
+            let keep = (!ignored.contains(name) || active_optional_peers.contains(name))
+                && !child_is_mismatched;
             if !keep {
                 removed.push(name.clone());
             }
@@ -420,6 +428,7 @@ pub fn mark_transitive_peer_dependencies(graph: &mut aube_lockfile::LockfileGrap
         let own: BTreeSet<String> = pkg
             .peer_dependencies_with_meta_defaults()
             .into_keys()
+            .filter(|p| !pkg.pnpm_peer_is_shadowed(p))
             .filter(|p| !pkg.dependencies.contains_key(p))
             .collect();
         if !own.is_empty() {
@@ -457,7 +466,11 @@ pub fn mark_transitive_peer_dependencies(graph: &mut aube_lockfile::LockfileGrap
         // contract, so pnpm leaves it out even when a dependency bubbles
         // the same name up (e.g. `remix` and `@remix-run/test` both
         // declaring an optional `playwright`).
-        for own in pkg.peer_dependencies_with_meta_defaults().keys() {
+        for own in pkg
+            .peer_dependencies_with_meta_defaults()
+            .keys()
+            .filter(|p| !pkg.pnpm_peer_is_shadowed(p))
+        {
             names.remove(own);
         }
         pkg.transitive_peer_dependencies = names.into_iter().collect();
@@ -470,6 +483,112 @@ mod tests {
 
     fn s(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    #[test]
+    fn platform_skipped_optional_declarations_still_shadow_required_peers() {
+        use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph};
+        for ignored in [false, true] {
+            let mut graph = LockfileGraph::default();
+            graph.importers.insert(
+                ".".into(),
+                vec![DirectDep {
+                    name: "host".into(),
+                    dep_path: "host@1.0.0".into(),
+                    dep_type: DepType::Production,
+                    specifier: Some("1.0.0".into()),
+                }],
+            );
+            graph.packages.insert(
+                "host@1.0.0".into(),
+                LockedPackage {
+                    name: "host".into(),
+                    version: "1.0.0".into(),
+                    dep_path: "host@1.0.0".into(),
+                    declared_dependencies: [("peer".into(), "1.0.0".into())].into(),
+                    dependencies: [("peer".into(), "1.0.0".into())].into(),
+                    optional_dependencies: [("peer".into(), "1.0.0".into())].into(),
+                    peer_dependencies: [("peer".into(), "^1".into())].into(),
+                    ..Default::default()
+                },
+            );
+            graph.packages.insert(
+                "peer@1.0.0".into(),
+                LockedPackage {
+                    name: "peer".into(),
+                    version: "1.0.0".into(),
+                    dep_path: "peer@1.0.0".into(),
+                    os: s(&["aix"]).into(),
+                    ..Default::default()
+                },
+            );
+            let ignored = if ignored {
+                ["peer".into()].into()
+            } else {
+                Default::default()
+            };
+            filter_graph(
+                &mut graph,
+                &SupportedArchitectures {
+                    os: s(&["darwin"]),
+                    cpu: s(&["arm64"]),
+                    ..Default::default()
+                },
+                &ignored,
+            );
+            let host = &graph.packages["host@1.0.0"];
+            assert!(!host.dependencies.contains_key("peer"));
+            assert!(!host.optional_dependencies.contains_key("peer"));
+            assert_eq!(host.pnpm_peer_is_shadowed("peer"), ignored.is_empty());
+            assert_eq!(
+                crate::detect_unmet_peers(&graph).is_empty(),
+                ignored.is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_names_keep_peer_only_optional_edges() {
+        use aube_lockfile::{DepType, DirectDep, LockedPackage, LockfileGraph, PeerDepMeta};
+        let mut graph = LockfileGraph::default();
+        graph.importers.insert(
+            ".".into(),
+            vec![DirectDep {
+                name: "host".into(),
+                dep_path: "host@1.0.0".into(),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".into()),
+            }],
+        );
+        graph.packages.insert(
+            "host@1.0.0".into(),
+            LockedPackage {
+                name: "host".into(),
+                version: "1.0.0".into(),
+                dep_path: "host@1.0.0".into(),
+                dependencies: [("peer".into(), "1.0.0".into())].into(),
+                optional_dependencies: [("peer".into(), "1.0.0".into())].into(),
+                peer_dependencies: [("peer".into(), "^1".into())].into(),
+                peer_dependencies_meta: [("peer".into(), PeerDepMeta { optional: true })].into(),
+                ..Default::default()
+            },
+        );
+        graph.packages.insert(
+            "peer@1.0.0".into(),
+            LockedPackage {
+                name: "peer".into(),
+                version: "1.0.0".into(),
+                dep_path: "peer@1.0.0".into(),
+                ..Default::default()
+            },
+        );
+        filter_graph(
+            &mut graph,
+            &SupportedArchitectures::default(),
+            &["peer".into()].into(),
+        );
+        assert_eq!(graph.packages["host@1.0.0"].dependencies["peer"], "1.0.0");
+        assert!(graph.packages.contains_key("peer@1.0.0"));
     }
 
     #[test]

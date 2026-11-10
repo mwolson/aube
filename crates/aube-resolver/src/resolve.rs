@@ -44,6 +44,19 @@ impl Resolver {
         existing: Option<&LockfileGraph>,
         workspace_packages: &HashMap<String, String>,
     ) -> Result<LockfileGraph, Error> {
+        self.resolve_workspace_with_peer_history(manifests, existing, workspace_packages, existing)
+            .await
+    }
+
+    /// Resolve with separate peer history when update excludes selected snapshots
+    /// from version reuse. Compatible optional peers can survive a version change.
+    pub async fn resolve_workspace_with_peer_history(
+        &mut self,
+        manifests: &[(String, PackageJson)],
+        existing: Option<&LockfileGraph>,
+        workspace_packages: &HashMap<String, String>,
+        peer_history: Option<&LockfileGraph>,
+    ) -> Result<LockfileGraph, Error> {
         // Run `readPackage` over each importer's own manifest before
         // seeding, matching pnpm — which fires the hook on workspace
         // project manifests, not just resolved registry packages. This
@@ -61,7 +74,7 @@ impl Resolver {
             None
         };
         let manifests = hooked_manifests.as_deref().unwrap_or(manifests);
-        driver::ResolveDriver::new(self, manifests, existing, workspace_packages)
+        driver::ResolveDriver::new(self, manifests, existing, workspace_packages, peer_history)
             .run()
             .await
     }
@@ -139,6 +152,7 @@ impl Resolver {
         skipped_optional_dependencies: BTreeMap<String, BTreeMap<String, String>>,
         catalog_picks: BTreeMap<String, BTreeMap<String, String>>,
         previous: Option<&LockfileGraph>,
+        retain_optional_peer_contexts: bool,
     ) -> Result<LockfileGraph, Error> {
         let resolved_catalogs =
             catalog::materialize_catalog_picks(catalog_picks, resolved_versions);
@@ -185,6 +199,7 @@ impl Resolver {
         // Second pass: compute peer-context suffixes for every reachable
         // package. See `apply_peer_contexts` for the details.
         let peer_options = PeerContextOptions {
+            retain_optional_peer_contexts,
             dedupe_peer_dependents: self.dedupe_peer_dependents,
             dedupe_peers: self.dedupe_peers,
             resolve_from_workspace_root: self.resolve_peers_from_workspace_root,

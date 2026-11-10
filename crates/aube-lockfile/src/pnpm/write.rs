@@ -573,7 +573,8 @@ pub fn write_with_project_root(
         // peer out of peer-context resolution (which would bind it to an
         // unrelated copy in the tree and grow spurious dep-path suffixes).
         let peer_deps = {
-            let deps = pkg.peer_dependencies_with_meta_defaults();
+            let mut deps = pkg.peer_dependencies_with_meta_defaults();
+            deps.retain(|name, _| !pkg.pnpm_peer_is_shadowed(name));
             if deps.is_empty() { None } else { Some(deps) }
         };
         // pnpm drops `optional: false` entries rather than writing them,
@@ -581,7 +582,7 @@ pub fn write_with_project_root(
         let peer_meta: BTreeMap<_, _> = pkg
             .peer_dependencies_meta
             .iter()
-            .filter(|(_, v)| v.optional)
+            .filter(|(name, v)| v.optional && !pkg.pnpm_peer_is_shadowed(name))
             .map(|(k, _)| (k.clone(), WritablePeerDepMeta { optional: true }))
             .collect();
         let peer_meta = if peer_meta.is_empty() {

@@ -42,6 +42,7 @@ pub const EXTRA_REGISTRY_SHASUM: &str = "__aube_registry_shasum";
 /// Internal `extra_meta` marker behind
 /// [`LockedPackage::declared_dependencies_known`]. Writers never emit it.
 pub(crate) const EXTRA_DECLARED_DEPENDENCIES_KNOWN: &str = "__aube_declared_dependencies_known";
+const EXTRA_PNPM_DEPENDENCY_KINDS: &str = "__aube_pnpm_dependency_kinds";
 /// Internal `extra_meta` key holding a package-lock.json entry's `funding`
 /// value verbatim (`type` keys and arrays included), so the npm writer
 /// re-emits it instead of the URL-only form `funding_url` models.
@@ -531,6 +532,61 @@ impl LockedPackage {
         self
     }
 
+    /// Preserve declaration kinds before platform filtering removes optional edges.
+    /// Ignored optional declarations do not participate in pnpm peer shadowing.
+    pub fn record_pnpm_dependency_declarations(
+        &mut self,
+        optional: &BTreeMap<String, String>,
+        ignored: &BTreeSet<String>,
+    ) {
+        let kinds = self
+            .extra_meta
+            .entry(EXTRA_PNPM_DEPENDENCY_KINDS.to_string())
+            .or_insert_with(|| {
+                serde_json::Value::Object(
+                    self.declared_dependencies
+                        .keys()
+                        .map(|name| (name.clone(), optional.contains_key(name).into()))
+                        .collect(),
+                )
+            });
+        if let Some(kinds) = kinds.as_object_mut() {
+            kinds.retain(|name, optional| optional != true || !ignored.contains(name));
+        }
+    }
+
+    /// Record pnpm dependency kinds while constructing a resolved package.
+    pub fn with_pnpm_dependency_declarations(
+        mut self,
+        optional: &BTreeMap<String, String>,
+        ignored: &BTreeSet<String>,
+    ) -> Self {
+        self.record_pnpm_dependency_declarations(optional, ignored);
+        self
+    }
+
+    /// pnpm shadows a same-name peer for a non-ignored declaration when either
+    /// declaration is optional, including platform-skipped optional dependencies.
+    /// Keep the full source declarations intact for other lockfile formats.
+    pub fn pnpm_peer_is_shadowed(&self, name: &str) -> bool {
+        let optional = if let Some(kinds) = self.extra_meta.get(EXTRA_PNPM_DEPENDENCY_KINDS) {
+            let Some(optional) = kinds.get(name).and_then(serde_json::Value::as_bool) else {
+                return false;
+            };
+            optional
+        } else {
+            if !self.declared_dependencies.contains_key(name) {
+                return false;
+            }
+            self.optional_dependencies.contains_key(name)
+        };
+        optional
+            || self
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional)
+    }
+
     /// The package name to use for registry / store operations — the real
     /// name behind an npm-alias when aliased, otherwise just `name`. Used
     /// at every site that derives a tarball URL, a packument URL, or an
@@ -672,7 +728,9 @@ mod locked_package_tests {
         let mut prior = LockfileGraph::default();
         prior.packages.insert(
             "pkg@1.0.0".to_string(),
-            pkg().with_declared_dependencies_known(),
+            pkg()
+                .with_declared_dependencies_known()
+                .with_pnpm_dependency_declarations(&BTreeMap::new(), &BTreeSet::new()),
         );
         let mut graph = LockfileGraph::default();
         graph.packages.insert("pkg@1.0.0".to_string(), pkg());
@@ -680,6 +738,11 @@ mod locked_package_tests {
         graph.overlay_metadata_from(&prior);
 
         assert!(!graph.packages["pkg@1.0.0"].declared_dependencies_known());
+        assert!(
+            !graph.packages["pkg@1.0.0"]
+                .extra_meta
+                .contains_key(EXTRA_PNPM_DEPENDENCY_KINDS)
+        );
     }
 
     #[test]
@@ -1310,10 +1373,10 @@ impl LockfileGraph {
             // meta block) can't be recovered from a fresh resolve,
             // so carry them forward when the newer graph doesn't
             // already carry its own. `self`-side keys always win.
-            // The declared-set marker describes the prior entry's
-            // `declared_dependencies`, which isn't carried over.
+            // The declared-set marker and dependency kinds describe the
+            // prior entry's `declared_dependencies`, which isn't carried over.
             for (k, v) in &prior_pkg.extra_meta {
-                if k == EXTRA_DECLARED_DEPENDENCIES_KNOWN {
+                if k == EXTRA_DECLARED_DEPENDENCIES_KNOWN || k == EXTRA_PNPM_DEPENDENCY_KINDS {
                     continue;
                 }
                 pkg.extra_meta.entry(k.clone()).or_insert_with(|| v.clone());

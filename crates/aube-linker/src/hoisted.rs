@@ -500,7 +500,8 @@ fn build_workspace_preferences(
                     discovery_order += 1;
                     entry
                 });
-            if pkg.peer_dependencies.contains_key(dep_name) {
+            if pkg.peer_dependencies.contains_key(dep_name) && !pkg.pnpm_peer_is_shadowed(dep_name)
+            {
                 entry.peer_dependents.insert(parent_dep_path.clone());
             } else {
                 entry.dependents.insert(parent_dep_path.clone());

@@ -2009,3 +2009,294 @@ fn boolean_bundle_bins_survive_clean_frozen_pnpm_install() {
         }
     }
 }
+
+#[test]
+fn update_optional_peer_history_follows_command_targets() {
+    let _guard = e2e_lock();
+    for transitive in [false, true] {
+        for recursive in [false, true] {
+            for target in [
+                None,
+                Some("consumer"),
+                Some("peer"),
+                Some("consumer@latest"),
+                Some("consumer-reject"),
+                Some("interactive"),
+                Some("interactive-all"),
+                Some("interactive-all-ignored"),
+                Some("latest-all"),
+                Some("filtered-all"),
+                Some("production"),
+            ] {
+                let interactive = target.is_some_and(|target| target.starts_with("interactive"));
+                if interactive && (transitive || !cfg!(unix)) {
+                    continue;
+                }
+                if matches!(
+                    target,
+                    Some(
+                        "interactive-all"
+                            | "interactive-all-ignored"
+                            | "latest-all"
+                            | "filtered-all"
+                            | "production"
+                    )
+                ) && (transitive || recursive)
+                {
+                    continue;
+                }
+                let sbx = Sandbox::new();
+                let direct = if transitive { "holder" } else { "consumer" };
+                let mut dependencies = serde_json::json!({direct:"1.0.0", "other":"1.0.0"});
+                if target == Some("interactive-all") {
+                    dependencies.as_object_mut().unwrap().remove("other");
+                }
+                sbx.write_manifest(
+                    &serde_json::json!({
+                        "name":"root", "private":true, "dependencies":dependencies
+                    })
+                    .to_string(),
+                );
+                if target == Some("interactive-all-ignored") {
+                    fs::write(
+                        sbx.project.join("pnpm-workspace.yaml"),
+                        "updateConfig:\n  ignoreDependencies:\n    - other\n",
+                    )
+                    .unwrap();
+                } else if target == Some("filtered-all") {
+                    fs::write(sbx.project.join("pnpm-workspace.yaml"), "packages: []\n").unwrap();
+                }
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let _enter = runtime.enter();
+                let listener = tokio::net::TcpListener::from_std({
+                    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    listener.set_nonblocking(true).unwrap();
+                    listener
+                })
+                .unwrap();
+                let registry = format!("http://{}/", listener.local_addr().unwrap());
+                fs::write(sbx.project.join(".npmrc"), format!("registry={registry}\n")).unwrap();
+                let mut packuments = std::collections::BTreeMap::new();
+                for name in ["consumer", "holder", "peer", "other"] {
+                    let mut metadata = serde_json::json!({
+                        "name":name, "version":"1.0.0",
+                        "dist":{"tarball":format!("{registry}{name}/-/{name}-1.0.0.tgz"), "integrity":aube_store::sha512_integrity(b"fixture")}
+                    });
+                    if name == "consumer" {
+                        metadata["peerDependencies"] = serde_json::json!({"peer":"^1"});
+                        metadata["peerDependenciesMeta"] =
+                            serde_json::json!({"peer":{"optional":true}});
+                    } else if name == "holder" {
+                        metadata["dependencies"] = serde_json::json!({"consumer":"1.0.0"});
+                    }
+                    let mut versions = serde_json::json!({"1.0.0":metadata.clone()});
+                    let latest = if name == "consumer" {
+                        metadata["version"] = serde_json::json!("1.1.0");
+                        if target == Some("consumer-reject") {
+                            metadata["peerDependencies"] = serde_json::json!({"peer":"^2"});
+                        }
+                        versions["1.1.0"] = metadata;
+                        "1.1.0"
+                    } else {
+                        "1.0.0"
+                    };
+                    packuments.insert(
+                        name.to_string(),
+                        serde_json::json!({
+                            "name":name, "dist-tags":{"latest":latest}, "versions":versions
+                        })
+                        .to_string(),
+                    );
+                }
+                let server = runtime.spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let packuments = packuments.clone();
+                        tokio::spawn(async move {
+                            let mut request = [0; 8192];
+                            let count = socket.read(&mut request).await.unwrap();
+                            let request = String::from_utf8_lossy(&request[..count]);
+                            let name = request.split_whitespace().nth(1).unwrap().trim_start_matches('/');
+                            let (status, body) = match packuments.get(name) {
+                                Some(body) => ("200 OK", body.clone()),
+                                None => ("404 Not Found", format!("unexpected mock registry request: {name}")),
+                            };
+                            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        });
+                    }
+                });
+                let holder = if transitive {
+                    "  holder@1.0.0:\n    dependencies:\n      consumer: 1.0.0(peer@1.0.0)\n"
+                } else {
+                    ""
+                };
+                let direct_tail = if transitive {
+                    "1.0.0"
+                } else {
+                    "1.0.0(peer@1.0.0)"
+                };
+                let lock = format!(
+                    "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      {direct}:\n        specifier: 1.0.0\n        version: {direct_tail}\n      other:\n        specifier: 1.0.0\n        version: 1.0.0\npackages:\n  consumer@1.0.0:\n    resolution: {{integrity: ''}}\n    peerDependencies:\n      peer: ^1\n    peerDependenciesMeta:\n      peer:\n        optional: true\n  holder@1.0.0:\n    resolution: {{integrity: ''}}\n  peer@1.0.0:\n    resolution: {{integrity: ''}}\n  other@1.0.0:\n    resolution: {{integrity: ''}}\nsnapshots:\n  other@1.0.0: {{}}\n{holder}  consumer@1.0.0(peer@1.0.0):\n    optionalDependencies:\n      peer: 1.0.0\n  peer@1.0.0:\n    optional: true\n"
+                );
+                let path = sbx.project.join("pnpm-lock.yaml");
+                fs::write(&path, lock).unwrap();
+                let mut cmd = sbx.cmd();
+                cmd.args(["update", "--lockfile-only"])
+                    .env("AUBE_MINIMUM_RELEASE_AGE", "0");
+                if recursive {
+                    cmd.arg("-r");
+                }
+                if let Some(target) = target {
+                    cmd.arg(match target {
+                        "consumer-reject" => "consumer@latest",
+                        "interactive" | "interactive-all" | "interactive-all-ignored" => "-i",
+                        "latest-all" => "--latest",
+                        "filtered-all" => "--filter=root",
+                        "production" => "--prod",
+                        _ => target,
+                    });
+                }
+                let output = if interactive {
+                    #[cfg(unix)]
+                    {
+                        accept_update_picker(&cmd)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        unreachable!()
+                    }
+                } else {
+                    cmd.output().unwrap()
+                };
+                server.abort();
+                assert!(output.status.success(), "{output:?}");
+                let graph = aube_lockfile::pnpm::parse(&path).unwrap();
+                let consumer = graph
+                    .packages
+                    .values()
+                    .find(|pkg| pkg.name == "consumer")
+                    .unwrap();
+                assert_eq!(
+                    consumer.dependencies.contains_key("peer"),
+                    interactive
+                        || matches!(target, Some("consumer" | "consumer@latest" | "production")),
+                    "transitive={transitive}, recursive={recursive}, target={target:?}, graph={graph:?}, output={output:?}"
+                );
+                assert_eq!(
+                    graph.packages.values().any(|pkg| pkg.name == "peer"),
+                    interactive
+                        || matches!(target, Some("consumer" | "consumer@latest" | "production"))
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn accept_update_picker(cmd: &Command) -> std::process::Output {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    let (mut master, mut slave) = (-1, -1);
+    let mut size = libc::winsize {
+        ws_row: 30,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // openpty initializes two owned descriptors; the files close them below.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(size),
+            )
+        },
+        0
+    );
+    let mut master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let mut process = std::process::Command::new(cmd.get_program());
+    process
+        .args(cmd.get_args())
+        .current_dir(cmd.get_current_dir().unwrap());
+    for (key, value) in cmd.get_envs() {
+        if let Some(value) = value {
+            process.env(key, value);
+        } else {
+            process.env_remove(key);
+        }
+    }
+    process
+        .env("TERM", "xterm-256color")
+        .env_remove("CI")
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave.try_clone().unwrap());
+    // The picker needs a controlling terminal as well as terminal stdio.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = process.spawn().unwrap();
+    drop(process);
+    drop(slave);
+    let (send, receive) = std::sync::mpsc::channel();
+    let mut reader = master.try_clone().unwrap();
+    let output_reader = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buf = [0; 4096];
+        while let Ok(count) = reader.read(&mut buf) {
+            if count == 0 {
+                break;
+            }
+            output.extend_from_slice(&buf[..count]);
+            let _ = send.send(output.clone());
+        }
+        output
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut accepted = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("update picker timed out");
+        }
+        if let Ok(output) = receive.recv_timeout(Duration::from_millis(50))
+            && !accepted
+            && String::from_utf8_lossy(&output).contains("Choose which dependencies")
+        {
+            master.write_all(b"\r").unwrap();
+            accepted = true;
+        }
+    };
+    let output = output_reader.join().unwrap();
+    assert!(
+        accepted,
+        "picker was not shown: {}",
+        String::from_utf8_lossy(&output)
+    );
+    std::process::Output {
+        status,
+        stdout: output,
+        stderr: Vec::new(),
+    }
+}
