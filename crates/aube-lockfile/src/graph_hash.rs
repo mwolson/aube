@@ -980,4 +980,66 @@ mod tests {
             "alias-keyed patch must take precedence over the registry-keyed one"
         );
     }
+    #[test]
+    fn local_edges_preserve_hash_taint_and_filtered_subtrees() {
+        for path in ["vendor/child", "child.tgz"] {
+            for contextual in [false, true] {
+                let local = LocalSource::Directory(path.into());
+                let key = if contextual {
+                    format!("{}(peer@1.0.0)", local.dep_path("child"))
+                } else {
+                    local.dep_path("child")
+                };
+                let mut g = empty_graph();
+                let mut parent = mk_pkg("parent", "1.0.0", Some("sha512-P"));
+                parent
+                    .dependencies
+                    .insert("child".into(), format!("file:{path}(peer@1.0.0)"));
+                g.packages.insert(parent.dep_path.clone(), parent);
+                let mut child = mk_pkg("child", "1.0.0", None);
+                child.dep_path = key.clone();
+                child.local_source = Some(local);
+                child.dependencies.insert("leaf".into(), "1.0.0".into());
+                g.packages.insert(key.clone(), child);
+                let mut leaf = mk_pkg("leaf", "1.0.0", None);
+                leaf.local_source = Some(LocalSource::RemoteTarball(crate::RemoteTarballSource {
+                    url: "https://example.com/leaf.tgz".into(),
+                    integrity: "sha512-leaf".into(),
+                    git_hosted: false,
+                }));
+                g.packages.insert(leaf.dep_path.clone(), leaf);
+                g.importers.insert(
+                    ".".into(),
+                    vec![crate::DirectDep {
+                        name: "parent".into(),
+                        dep_path: "parent@1.0.0".into(),
+                        dep_type: crate::DepType::Production,
+                        specifier: Some("1.0.0".into()),
+                    }],
+                );
+                let hash = |content: &str, engine: &str| {
+                    compute_graph_hashes_full(
+                        &g,
+                        &|pkg| pkg.name == "leaf",
+                        Some(&EngineName(engine.into())),
+                        &|_, _| None,
+                        &|dp| (dp == key).then(|| content.to_string()),
+                    )
+                };
+                let first = hash("first", "node20");
+                assert_ne!(
+                    first.node_hash["parent@1.0.0"],
+                    hash("second", "node20").node_hash["parent@1.0.0"]
+                );
+                assert_ne!(
+                    first.node_hash["parent@1.0.0"],
+                    hash("first", "node22").node_hash["parent@1.0.0"]
+                );
+                assert!(content_affected_dep_paths(&g).contains("parent@1.0.0"));
+                let filtered = g.filter_deps(|_| true);
+                assert_eq!(filtered.packages.len(), 3);
+                assert!(filtered.packages.contains_key(&key));
+            }
+        }
+    }
 }

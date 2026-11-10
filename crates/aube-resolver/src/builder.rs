@@ -46,6 +46,7 @@ impl Resolver {
             vulnerable_ranges: BTreeMap::new(),
             git_shallow_hosts: Vec::new(),
             peers_suffix_max_length: 1000,
+            peer_patch_hashes: BTreeMap::new(),
             dedupe_peer_dependents: true,
             dedupe_peers: false,
             resolve_peers_from_workspace_root: true,
@@ -92,6 +93,7 @@ impl Resolver {
                 vulnerable_ranges: BTreeMap::new(),
                 git_shallow_hosts: Vec::new(),
                 peers_suffix_max_length: 1000,
+                peer_patch_hashes: BTreeMap::new(),
                 dedupe_peer_dependents: true,
                 dedupe_peers: false,
                 resolve_peers_from_workspace_root: true,
@@ -170,11 +172,14 @@ impl Resolver {
         self
     }
 
-    /// Configure pnpm's `peersSuffixMaxLength`. When the peer suffix body
-    /// on a `dep_path` would exceed this many bytes, the post-pass
-    /// replaces the whole suffix with a parenthesized short hash
-    /// `(<short-hash>)` (pnpm's `createPeerDepGraphHash`). Default 1000
-    /// (pnpm's default).
+    /// Supply normalized patch-content hashes before peer contexts are hashed.
+    pub fn with_peer_patch_hashes(mut self, hashes: BTreeMap<String, String>) -> Self {
+        self.peer_patch_hashes = hashes;
+        self
+    }
+
+    /// Configure pnpm's `peersSuffixMaxLength`. Suffix bodies longer than
+    /// this cap use pnpm's parenthesized short SHA-256 hash. Default 1000.
     pub fn with_peers_suffix_max_length(mut self, max_length: usize) -> Self {
         self.peers_suffix_max_length = max_length;
         self

@@ -1358,4 +1358,52 @@ mod tests {
         assert!(dirs.contains(&&root_nm.join("shared")));
         assert!(dirs.contains(&&PathBuf::from("/sibling/node_modules/shared")));
     }
+    #[test]
+    fn local_edges_resolve_contextual_targets_before_bare_fallback() {
+        let root_nm = PathBuf::from("/workspace/node_modules");
+        for path in ["vendor/child", "child.tgz"] {
+            for contextual in [false, true] {
+                let bare = LocalSource::Directory(path.into()).dep_path("child");
+                let selected = if contextual {
+                    format!("{bare}(peer@1.0.0)")
+                } else {
+                    bare.clone()
+                };
+                let edge = format!("file:{path}(peer@1.0.0)");
+                let mut graph = LockfileGraph::default();
+                graph.packages.insert(
+                    "host@1.0.0".into(),
+                    pkg("host", "1.0.0", &[("child", &edge)]),
+                );
+                let mut child = pkg("child", "1.0.0", &[("leaf", "1.0.0")]);
+                child.dep_path = selected.clone();
+                graph.packages.insert(selected.clone(), child);
+                if contextual {
+                    let mut other = pkg("child", "2.0.0", &[]);
+                    other.dep_path = bare.clone();
+                    graph.packages.insert(bare.clone(), other);
+                }
+                graph
+                    .packages
+                    .insert("leaf@1.0.0".into(), pkg("leaf", "1.0.0", &[]));
+                let importers = vec![HoistedWorkspaceImporter {
+                    modules_dir: root_nm.clone(),
+                    dependencies: vec![dep("host", "host@1.0.0")],
+                }];
+                let preferred = build_workspace_preferences(&root_nm, &importers, &graph);
+                assert_eq!(preferred.get("child"), Some(&selected));
+                assert_eq!(
+                    preferred.get("leaf").map(String::as_str),
+                    Some("leaf@1.0.0")
+                );
+                let plan =
+                    plan_workspace(&root_nm, &importers, &graph, HoistingLimits::None).unwrap();
+                assert_eq!(package_dir(&plan, &selected), root_nm.join("child"));
+                assert_eq!(package_dir(&plan, "leaf@1.0.0"), root_nm.join("leaf"));
+                if contextual {
+                    assert!(package_dirs(&plan, &bare).is_empty());
+                }
+            }
+        }
+    }
 }

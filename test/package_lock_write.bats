@@ -760,3 +760,37 @@ JSON
 	assert [ -e "$is_odd_dir/node_modules/is-number" ]
 	assert [ -e "$is_odd_dir/node_modules/is-odd" ]
 }
+
+@test "bun patch paths survive an unrelated non-frozen add" {
+    local bun_bin="${BUN_BIN:-bun}"
+    command -v "$bun_bin" >/dev/null || skip "bun is not installed"
+    cp "$PROJECT_ROOT/fixtures/import-bun/package.json" .
+    cp "$PROJECT_ROOT/fixtures/import-bun/bun.lock" .
+    mkdir patches
+    cat >patches/is-odd.patch <<'PATCH'
+diff --git a/aube-patch-marker.txt b/aube-patch-marker.txt
+new file mode 100644
+--- /dev/null
++++ b/aube-patch-marker.txt
+@@ -0,0 +1 @@
++patch survived
+PATCH
+    node <<'JS'
+const fs = require('fs');
+const patchedDependencies = { 'is-odd@3.0.1': 'patches/is-odd.patch' };
+const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+manifest.patchedDependencies = patchedDependencies;
+fs.writeFileSync('package.json', JSON.stringify(manifest));
+const lock = fs.readFileSync('bun.lock', 'utf8');
+fs.writeFileSync('bun.lock', lock.replace('"packages":', '"patchedDependencies": ' + JSON.stringify(patchedDependencies) + ',\n  "packages":'));
+JS
+    run aube add is-number@7.0.0 --ignore-scripts
+    assert_success
+    run grep -F '"is-odd@3.0.1": "patches/is-odd.patch"' bun.lock
+    assert_success
+    rm -rf node_modules
+    run "$bun_bin" install --frozen-lockfile --ignore-scripts
+    assert_success
+    run cat node_modules/is-odd/aube-patch-marker.txt
+    assert_output "patch survived"
+}

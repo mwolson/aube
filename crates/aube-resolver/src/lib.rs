@@ -201,6 +201,8 @@ pub struct Resolver {
     /// the first 32 chars of SHA-256 of the body, matching pnpm's
     /// `createPeerDepGraphHash` lockfile format. Default 1000.
     peers_suffix_max_length: usize,
+    /// Patch identities included in nested provider paths before peer hashing.
+    peer_patch_hashes: BTreeMap<String, String>,
     /// pnpm's `dedupe-peer-dependents`. When true (pnpm's default),
     /// the peer-context post-pass collapses multiple dep_path variants
     /// of the same canonical package into a single entry when their
