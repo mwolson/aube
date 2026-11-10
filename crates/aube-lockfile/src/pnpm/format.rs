@@ -145,14 +145,14 @@ pub(super) fn reformat_for_pnpm_parity(yaml: &str) -> String {
         let stripped = line.trim_start();
         let indent = line.len() - stripped.len();
         let is_top = indent == 0 && !stripped.is_empty();
-        // Entry headers inside `packages:` / `snapshots:` are always at
-        // 2-indent with a `:` in the line. Either trailing (`foo@1:`
-        // with a child block below) or inline (`foo@1: {}` for empty
-        // snapshots). List markers (`- …`) never appear at this level,
-        // so a leading `-` rules out false positives on
-        // `ignoredOptionalDependencies:` items.
-        let is_entry_header =
-            in_entries && indent == 2 && !stripped.starts_with('-') && stripped.contains(':');
+        // Explicit entries start at `? key`; their separate `: value`
+        // indicator must stay attached. Inline keys contain a colon.
+        let is_entry_header = in_entries
+            && indent == 2
+            && (stripped.starts_with("? ")
+                || (!stripped.starts_with('-')
+                    && !stripped.starts_with(':')
+                    && stripped.contains(':')));
 
         if (is_top && idx > 0) || is_entry_header {
             out.push('\n');
@@ -414,6 +414,23 @@ mod tests {
             "inline empty:\n{out}"
         );
         assert!(!out.contains("? '"), "no explicit key left:\n{out}");
+    }
+
+    #[test]
+    fn separates_explicit_entries_before_the_key_in_packages_and_snapshots() {
+        for section in ["packages", "snapshots"] {
+            for prefix in ["long@1.0.0", "'@scope/long@file:local"] {
+                let quote = if prefix.starts_with('\'') { "'" } else { "" };
+                let key = format!("{prefix}({}){quote}", "peer@1.0.0".repeat(110));
+                let input = format!(
+                    "{section}:\n  before@1.0.0: {{}}\n  ? {key}\n  : dependencies:\n      peer: 1.0.0\n  after@1.0.0: {{}}\n"
+                );
+                let expected = format!(
+                    "{section}:\n\n  before@1.0.0: {{}}\n\n  ? {key}\n  : dependencies:\n      peer: 1.0.0\n\n  after@1.0.0: {{}}\n"
+                );
+                assert_eq!(reformat_for_pnpm_parity(&input), expected, "{section}");
+            }
+        }
     }
 
     #[test]

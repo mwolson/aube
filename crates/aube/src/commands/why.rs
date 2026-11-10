@@ -299,10 +299,14 @@ fn walk(
             frames: stack.clone(),
         });
     } else {
-        // `pkg.dependencies` stores (name → version); the dep_path is
-        // `{name}@{version}` (see resolver::dep_path_for, list::render_json).
         for (child_name, child_version) in &pkg.dependencies {
-            let child_dep_path = format!("{child_name}@{child_version}");
+            let Some(child_dep_path) =
+                aube_lockfile::resolve_dep_edge(child_name, child_version, |key| {
+                    graph.packages.contains_key(key)
+                })
+            else {
+                continue;
+            };
             walk(
                 graph,
                 &child_dep_path,

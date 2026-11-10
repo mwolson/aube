@@ -2094,6 +2094,7 @@ mod drift_tests {
             importers: BTreeMap::new(),
             packages: BTreeMap::new(),
             settings: LockfileSettings {
+                extra: BTreeMap::new(),
                 auto_install_peers: false,
                 exclude_links_from_lockfile: true,
                 lockfile_include_tarball_url: false,
@@ -2327,6 +2328,7 @@ mod drift_tests {
             importers,
             packages: BTreeMap::new(),
             settings: LockfileSettings {
+                extra: BTreeMap::new(),
                 auto_install_peers: false,
                 exclude_links_from_lockfile: true,
                 lockfile_include_tarball_url: true,
