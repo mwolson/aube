@@ -42,6 +42,8 @@ use std::time::{Duration, Instant};
 pub(crate) struct ResolveDriver<'a> {
     resolver: &'a mut Resolver,
     existing: Option<&'a LockfileGraph>,
+    peer_history: Option<&'a LockfileGraph>,
+    peer_history_index: Option<LockedIndex<'a>>,
     workspace_packages: &'a HashMap<String, String>,
 
     /// Borrowed set of names present in the existing lockfile. Used as
@@ -65,6 +67,8 @@ pub(crate) struct ResolveDriver<'a> {
     /// Packages reached from surviving roots without following ambiguous
     /// optional-peer edges. These can supply peers without metadata fetches.
     independent_locked_packages: FxHashSet<String>,
+    /// Providers already retained only through optional edges in the old lockfile.
+    optional_only_locked_packages: FxHashSet<String>,
     /// A registry version shared by aliases must run readPackage only once
     /// when refreshing the declarations missing from a snapshot.
     refreshed_dependency_metadata: FxHashMap<(String, String), aube_registry::VersionMetadata>,
@@ -152,6 +156,7 @@ impl<'a> ResolveDriver<'a> {
         manifests: &[(String, PackageJson)],
         existing: Option<&'a LockfileGraph>,
         workspace_packages: &'a HashMap<String, String>,
+        peer_history: Option<&'a LockfileGraph>,
     ) -> Self {
         let mut queue: VecDeque<ResolveTask> = VecDeque::with_capacity(512);
         let mut importers: BTreeMap<String, Vec<DirectDep>> = BTreeMap::new();
@@ -196,7 +201,9 @@ impl<'a> ResolveDriver<'a> {
             &mut queue,
             &mut importers,
         );
-        let independent_locked_packages = independent_locked_packages(existing, &queue, resolver);
+        let independent_locked_packages =
+            independent_locked_packages(peer_history, &queue, resolver);
+        let optional_only_locked_packages = optional_only_locked_packages(peer_history, resolver);
 
         // Adaptive packument concurrency. Loaded from the cross-run
         // persistent store when available so the limiter resumes the
@@ -242,15 +249,21 @@ impl<'a> ResolveDriver<'a> {
             .map(|g| g.packages.values().map(|p| p.name.as_str()).collect())
             .unwrap_or_default();
         let locked_index = LockedIndex::new(existing);
+        let peer_history_index = peer_history
+            .filter(|history| existing.is_none_or(|reuse| !std::ptr::eq(*history, reuse)))
+            .map(|history| LockedIndex::new(Some(history)));
 
         Self {
             resolver,
             existing,
+            peer_history,
+            peer_history_index,
             workspace_packages,
             existing_names,
             locked_index,
             importer_declared_dep_names,
             independent_locked_packages,
+            optional_only_locked_packages,
             refreshed_dependency_metadata: FxHashMap::default(),
             resolved: BTreeMap::new(),
             resolved_versions: FxHashMap::with_capacity_and_hasher(1024, Default::default()),
@@ -319,7 +332,8 @@ impl<'a> ResolveDriver<'a> {
             self.resolved_times,
             self.skipped_optional_dependencies,
             self.catalog_picks,
-            self.existing,
+            self.peer_history.or(self.existing),
+            self.peer_history.is_some(),
         )?;
         if let Some((state, sem)) = self.packument_persist_handle {
             sem.persist(&state, "packument:default");
@@ -1361,7 +1375,11 @@ impl<'a> ResolveDriver<'a> {
                     meta
                 },
             }
-            .with_declared_dependencies_known(),
+            .with_declared_dependencies_known()
+            .with_pnpm_dependency_declarations(
+                &version_meta.optional_dependencies,
+                &self.resolver.ignored_optional_dependencies,
+            ),
         );
 
         // Enqueue transitive deps. Kick off a background
@@ -1381,6 +1399,7 @@ impl<'a> ResolveDriver<'a> {
         let mut child_ancestors = task.ancestors.to_vec();
         child_ancestors.push((task.name.clone(), version.clone()));
         let child_ancestors: Arc<[(String, String)]> = child_ancestors.into();
+        self.queue_locked_optional_peers(&task, &version, &child_ancestors);
 
         for (dep_name, dep_range) in &version_meta.dependencies {
             if bundled_names.contains(dep_name) {
@@ -1860,7 +1879,11 @@ impl<'a> ResolveDriver<'a> {
                     declared_dependencies,
                     ..Default::default()
                 }
-                .with_declared_dependencies_known(),
+                .with_declared_dependencies_known()
+                .with_pnpm_dependency_declarations(
+                    &target_optional_deps,
+                    &self.resolver.ignored_optional_dependencies,
+                ),
             );
             if let Some(ref tx) = self.resolver.resolved_tx {
                 let pending = self.queue.len()
@@ -2201,15 +2224,103 @@ impl<'a> ResolveDriver<'a> {
         Ok(metadata)
     }
 
+    fn queue_locked_optional_peers(
+        &mut self,
+        task: &ResolveTask,
+        version: &str,
+        child_ancestors: &Arc<[(String, String)]>,
+    ) {
+        if self.peer_history.is_none() {
+            return;
+        }
+        let Some(current) = self.resolved.get(&dep_path_for(&task.name, version)) else {
+            return;
+        };
+        // Resolution canonicalizes each name/version once. Retain providers
+        // from every old context so the peer pass can restore each path.
+        let mut providers = BTreeSet::new();
+        for snapshot in self
+            .peer_history_index
+            .as_ref()
+            .unwrap_or(&self.locked_index)
+            .bucket(&task.name)
+        {
+            for (name, tail) in &snapshot.dependencies {
+                if !snapshot.optional_dependencies.contains_key(name)
+                    || !current
+                        .peer_dependencies_meta
+                        .get(name)
+                        .is_some_and(|meta| meta.optional)
+                    || current.declared_dependencies.contains_key(name)
+                    || !(self.optional_peer_was_optional_only(snapshot, name)
+                        || self.optional_peer_is_independently_provided(snapshot, name))
+                {
+                    continue;
+                }
+                let prefix = format!("{name}@");
+                let tail = tail.strip_prefix(&prefix).unwrap_or(tail);
+                let version = tail.split('(').next().unwrap_or(tail);
+                if snapshot.version != current.version
+                    && current
+                        .peer_dependencies
+                        .get(name)
+                        .is_none_or(|range| !version_satisfies(version, range))
+                {
+                    continue;
+                }
+                // An explicitly updated provider is absent from reuse and must
+                // not be resurrected through its old optional-peer binding.
+                if self
+                    .locked_index
+                    .find_first_in_range(name, version)
+                    .is_some()
+                {
+                    providers.insert((name.clone(), version.to_string()));
+                }
+            }
+        }
+        for (name, range) in providers {
+            self.queue.push_back(ResolveTask::transitive(
+                name,
+                range,
+                DepType::Optional,
+                dep_path_for(&task.name, version),
+                task.importer.clone(),
+                child_ancestors.clone(),
+            ));
+        }
+    }
+
     fn optional_peer_is_independently_provided(&self, pkg: &LockedPackage, name: &str) -> bool {
-        let Some(graph) = self.existing else {
+        let Some(graph) = self.peer_history else {
             return false;
         };
         let Some(tail) = pkg.dependencies.get(name) else {
             return false;
         };
         aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
-            .is_some_and(|key| self.independent_locked_packages.contains(&key))
+            .is_some_and(|key| {
+                self.independent_locked_packages.contains(&key)
+                    && self
+                        .existing
+                        .is_some_and(|graph| graph.packages.contains_key(&key))
+            })
+    }
+
+    fn optional_peer_was_optional_only(&self, pkg: &LockedPackage, name: &str) -> bool {
+        let Some(graph) = self.peer_history else {
+            return false;
+        };
+        let Some(tail) = pkg.dependencies.get(name) else {
+            return false;
+        };
+        aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            .is_some_and(|key| {
+                self.optional_only_locked_packages.contains(&key)
+                    && self
+                        .existing
+                        .is_some_and(|graph| graph.packages.contains_key(&key))
+            })
     }
 
     /// Wire `task` into the resolver graph as a reuse of an
@@ -2367,7 +2478,8 @@ impl<'a> ResolveDriver<'a> {
                     && !locked_pkg.declared_dependencies.contains_key(name)
                     && (self.resolver.client.network_mode() != aube_registry::NetworkMode::Offline
                         || metadata_available
-                        || !self.optional_peer_is_independently_provided(locked_pkg, name)
+                        || (!self.optional_peer_is_independently_provided(locked_pkg, name)
+                            && !self.optional_peer_was_optional_only(locked_pkg, name))
                         || self.refreshed_dependency_metadata.contains_key(&(
                             task.registry_name().to_string(),
                             locked_pkg.version.clone(),
@@ -2407,6 +2519,10 @@ impl<'a> ResolveDriver<'a> {
                 .filter(|(name, _)| metadata.optional_dependencies.contains_key(*name))
                 .map(|(name, version)| (name.clone(), version.clone()))
                 .collect();
+            hydrated.record_pnpm_dependency_declarations(
+                &metadata.optional_dependencies,
+                &self.resolver.ignored_optional_dependencies,
+            );
             &hydrated
         } else {
             locked_pkg
@@ -2540,19 +2656,20 @@ impl<'a> ResolveDriver<'a> {
             let mut child_ancestors = task.ancestors.to_vec();
             child_ancestors.push((task.name.clone(), version.clone()));
             let child_ancestors: Arc<[(String, String)]> = child_ancestors.into();
+            self.queue_locked_optional_peers(task, &version, &child_ancestors);
             for (dep_name, dep_version) in &locked_pkg.dependencies {
-                // Drop confirmed peer-only edges. Without metadata, an
-                // independently reachable target can keep its locked edge
-                // and type: dropping it and relying on peer rebinding could
-                // lose a real dependency or select a different version.
-                if locked_pkg
+                // Keep a locked optional binding when its provider survives.
+                // Rebinding from scratch can lose an out-of-range provider that
+                // pnpm retains. Removed independent providers still get pruned.
+                let peer_only = locked_pkg
                     .peer_dependencies_meta
                     .get(dep_name)
                     .is_some_and(|meta| meta.optional)
-                    && !locked_pkg.declared_dependencies.contains_key(dep_name)
-                    && (refresh_declarations
-                        || !self.optional_peer_is_independently_provided(locked_pkg, dep_name))
-                {
+                    && !locked_pkg.declared_dependencies.contains_key(dep_name);
+                let retained_optional_peer = peer_only
+                    && (self.optional_peer_was_optional_only(locked_pkg, dep_name)
+                        || self.optional_peer_is_independently_provided(locked_pkg, dep_name));
+                if peer_only && !retained_optional_peer {
                     continue;
                 }
                 let prefix = format!("{dep_name}@");
@@ -2588,7 +2705,9 @@ impl<'a> ResolveDriver<'a> {
                     };
                     canonical_version = declared.clone();
                 }
-                let dep_type = if locked_pkg.optional_dependencies.contains_key(dep_name) {
+                let dep_type = if locked_pkg.optional_dependencies.contains_key(dep_name)
+                    || (refresh_declarations && retained_optional_peer)
+                {
                     DepType::Optional
                 } else {
                     DepType::Production
@@ -2677,7 +2796,7 @@ fn independent_locked_packages(
     tasks: &VecDeque<ResolveTask>,
     resolver: &Resolver,
 ) -> FxHashSet<String> {
-    let mut reached = FxHashSet::default();
+    let reached = FxHashSet::default();
     let Some(graph) = existing else {
         return reached;
     };
@@ -2730,6 +2849,40 @@ fn independent_locked_packages(
             }
         }
     }
+    walk_independent_locked_packages(graph, pending, resolver)
+}
+
+/// pnpm keeps an existing optional-only provider on an unrelated add. A provider
+/// that previously had a real dependency path must still lose its peer-only
+/// bindings when that path is removed.
+fn optional_only_locked_packages(
+    existing: Option<&LockfileGraph>,
+    resolver: &Resolver,
+) -> FxHashSet<String> {
+    let Some(graph) = existing else {
+        return FxHashSet::default();
+    };
+    if graph.overrides != resolver.lockfile_overrides() {
+        return FxHashSet::default();
+    }
+    // Historical reachability must not depend on this run's filters.
+    let independent = crate::peer_context::independently_reachable_packages(graph);
+    graph
+        .packages
+        .iter()
+        .filter(|(key, pkg)| {
+            pkg.optional && pkg.local_source.is_none() && !independent.contains(*key)
+        })
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn walk_independent_locked_packages(
+    graph: &LockfileGraph,
+    mut pending: Vec<(String, bool)>,
+    resolver: &Resolver,
+) -> FxHashSet<String> {
+    let mut reached = FxHashSet::default();
     while let Some((key, optional)) = pending.pop() {
         let Some(pkg) = graph.packages.get(&key) else {
             continue;

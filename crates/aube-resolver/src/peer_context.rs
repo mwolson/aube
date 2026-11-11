@@ -199,6 +199,9 @@ fn scan_unmet_peers<'a>(
     let mut unmet = Vec::new();
     for pkg in packages {
         for (peer_name, declared_range) in &pkg.peer_dependencies {
+            if pkg.pnpm_peer_is_shadowed(peer_name) {
+                continue;
+            }
             let optional = pkg
                 .peer_dependencies_meta
                 .get(peer_name)
@@ -447,6 +450,9 @@ pub fn hoist_auto_installed_peers(mut graph: LockfileGraph) -> LockfileGraph {
 /// through the `Resolver`'s `with_*` setters.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerContextOptions {
+    /// Reuse optional peer bindings during installs and targeted updates.
+    /// Complete updates retain required peer contexts but recompute optionals.
+    pub retain_optional_peer_contexts: bool,
     /// When true, run the cross-subtree peer-variant collapse pass
     /// after every iteration of the fixed-point loop. Matches pnpm's
     /// default.
@@ -472,6 +478,7 @@ pub struct PeerContextOptions {
 impl Default for PeerContextOptions {
     fn default() -> Self {
         Self {
+            retain_optional_peer_contexts: true,
             dedupe_peer_dependents: true,
             dedupe_peers: false,
             resolve_from_workspace_root: true,
@@ -511,11 +518,37 @@ pub fn apply_peer_contexts(
 }
 
 pub(crate) fn apply_peer_contexts_with_lockfile(
-    canonical: LockfileGraph,
+    mut canonical: LockfileGraph,
     options: &PeerContextOptions,
     previous: Option<&LockfileGraph>,
     patch_hashes: &BTreeMap<String, String>,
 ) -> Result<LockfileGraph, crate::Error> {
+    // Shadow declarations only while calculating pnpm peer identities. Restore
+    // them for npm, Yarn and Bun, whose writers retain the source metadata.
+    let mut shadowed = BTreeMap::new();
+    for pkg in canonical.packages.values_mut() {
+        let names: BTreeSet<_> = pkg
+            .peer_dependencies
+            .keys()
+            .chain(pkg.peer_dependencies_meta.keys())
+            .filter(|name| pkg.pnpm_peer_is_shadowed(name))
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        shadowed.insert(
+            canonical_tail(&pkg.dep_path).to_string(),
+            (
+                pkg.peer_dependencies.clone(),
+                pkg.peer_dependencies_meta.clone(),
+            ),
+        );
+        pkg.peer_dependencies
+            .retain(|name, _| !names.contains(name));
+        pkg.peer_dependencies_meta
+            .retain(|name, _| !names.contains(name));
+    }
     const MIN_ITERATIONS: usize = 16;
     const MAX_ITERATIONS: usize = 256;
     // Each pass can propagate one more nested peer suffix through a chain.
@@ -631,11 +664,17 @@ pub(crate) fn apply_peer_contexts_with_lockfile(
     // so cycle detection during the fixed-point loop keeps the full
     // `name@version` form (otherwise unrelated same-version packages
     // would false-positive as back-references).
-    let result = if options.dedupe_peers {
+    let mut result = if options.dedupe_peers {
         dedupe_peer_suffixes(current)
     } else {
         current
     };
+    for pkg in result.packages.values_mut() {
+        if let Some((peers, meta)) = shadowed.get(canonical_tail(&pkg.dep_path)) {
+            pkg.peer_dependencies.clone_from(peers);
+            pkg.peer_dependencies_meta.clone_from(meta);
+        }
+    }
     Ok(result)
 }
 
@@ -947,6 +986,7 @@ fn apply_peer_contexts_once(
         name_index.entry(pkg.name.as_str()).or_default().push(pkg);
     }
 
+    let independent_packages = independently_reachable_packages(&canonical);
     let cyclic_peer_identities = cyclic_peer_identities(&canonical);
 
     // Root-importer scope used by `resolve-peers-from-workspace-root`.
@@ -1030,6 +1070,7 @@ fn apply_peer_contexts_once(
                 &dep.dep_path,
                 &canonical,
                 &name_index,
+                &independent_packages,
                 &importer_scope,
                 &root_scope,
                 &mut out_packages,
@@ -2100,6 +2141,50 @@ fn cyclic_peer_identities(graph: &LockfileGraph) -> FxHashSet<String> {
         .collect()
 }
 
+/// Reach the graph through real declarations, excluding remembered optional-peer
+/// bindings so those bindings cannot establish their own independent providers.
+/// pnpm snapshots cannot distinguish a dual optional dependency/peer declaration;
+/// declaration metadata, when available, makes that edge independently reachable.
+pub(crate) fn independently_reachable_packages(graph: &LockfileGraph) -> FxHashSet<String> {
+    let mut pending: Vec<_> = graph
+        .importers
+        .values()
+        .flatten()
+        .filter_map(|dep| {
+            if graph.packages.contains_key(&dep.dep_path) {
+                return Some(dep.dep_path.clone());
+            }
+            let tail = dep.dep_path.strip_prefix(&format!("{}@", dep.name))?;
+            aube_lockfile::resolve_dep_edge(&dep.name, tail, |key| graph.packages.contains_key(key))
+        })
+        .collect();
+    let mut reached = FxHashSet::default();
+    while let Some(key) = pending.pop() {
+        let Some(pkg) = graph.packages.get(&key) else {
+            continue;
+        };
+        if !reached.insert(key) {
+            continue;
+        }
+        for (name, tail) in &pkg.dependencies {
+            if pkg
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional)
+                && !pkg.declared_dependencies.contains_key(name)
+            {
+                continue;
+            }
+            if let Some(child) =
+                aube_lockfile::resolve_dep_edge(name, tail, |key| graph.packages.contains_key(key))
+            {
+                pending.push(child);
+            }
+        }
+    }
+    reached
+}
+
 fn changed_direct_providers(
     graph: &LockfileGraph,
     current: &[DirectDep],
@@ -2174,6 +2259,7 @@ fn visit_peer_context<'g>(
     input_dep_path: &str,
     graph: &'g LockfileGraph,
     name_index: &FxHashMap<&'g str, Vec<&'g LockedPackage>>,
+    independent_packages: &FxHashSet<String>,
     ancestor_scope: &FxHashMap<String, PeerProvider>,
     root_scope: &FxHashMap<String, PeerProvider>,
     out_packages: &mut BTreeMap<String, LockedPackage>,
@@ -2264,6 +2350,7 @@ fn visit_peer_context<'g>(
     // duplicate-instance "Cannot find module". Matching pnpm's *deduped*
     // output — bare — keeps the singleton intact.
     let mut peer_context: Vec<(String, PeerProvider)> = Vec::new();
+    let mut unbound_optional_peers = BTreeSet::new();
     for (peer_name, declared_range) in &pkg.peer_dependencies {
         let satisfies_declared = |provider: &PeerProvider| -> bool {
             version_satisfies(&provider.version, declared_range)
@@ -2316,11 +2403,12 @@ fn visit_peer_context<'g>(
         // from `new_dependencies`. The semver check is against the
         // package's canonical `version` field, not the tail, because
         // the tail may carry a peer suffix that isn't valid semver.
-        let from_graph_scan = || {
+        let from_graph_scan = |independent_only: bool| {
             name_index
                 .get(peer_name.as_str())
                 .into_iter()
                 .flat_map(|bucket| bucket.iter().copied())
+                .filter(|p| !independent_only || independent_packages.contains(&p.dep_path))
                 .filter(|p| version_satisfies(&p.version, declared_range))
                 .filter_map(|p| {
                     let tail = p
@@ -2353,21 +2441,88 @@ fn visit_peer_context<'g>(
             .peer_dependencies_meta
             .get(peer_name)
             .is_some_and(|m| m.optional);
-        let resolved = locked_context
-            .provider(peer_name, declared_range, graph)
-            .or(from_ancestor)
-            .or(from_pkg_deps)
-            .or(from_ancestor_incompatible)
-            .or(from_pkg_deps_incompatible)
-            .or(from_root)
-            .or(from_root_incompatible)
-            .or_else(|| {
-                (!is_optional || options.dedupe_peer_dependents)
-                    .then(from_graph_scan)
-                    .flatten()
-            });
+        // A retained pure optional-peer edge is a fallback for the current
+        // ancestor scope, including an incompatible newly provided version.
+        // A declared dependency still takes precedence over incompatible peers.
+        let from_optional_ancestor =
+            if is_optional && !pkg.declared_dependencies.contains_key(peer_name) {
+                from_ancestor_incompatible.clone()
+            } else {
+                None
+            };
+        // pnpm replaces an optional-only lockfile provider with a compatible
+        // real dependency from any importer, even with peer deduplication off.
+        // An independently reachable old provider still keeps its locked binding.
+        let from_retained_replacement = if is_optional
+            && !pkg.declared_dependencies.contains_key(peer_name)
+            && pkg.dependencies.get(peer_name).is_some_and(|tail| {
+                aube_lockfile::resolve_dep_edge(peer_name, tail, |key| {
+                    graph.packages.contains_key(key)
+                })
+                .is_some_and(|key| !independent_packages.contains(&key))
+            }) {
+            from_graph_scan(true)
+        } else {
+            None
+        };
+        // A new path has no historical binding to prefer. Pick a compatible
+        // provider deterministically before considering the canonical fallback,
+        // which can have been overwritten by another locked context's queue.
+        let new_optional_context = is_optional
+            && !pkg.declared_dependencies.contains_key(peer_name)
+            && locked_context.graph.is_some()
+            && locked_context.package().is_none()
+            && from_pkg_deps_incompatible.is_some()
+            && from_ancestor_incompatible.is_none();
+        let resolved = if new_optional_context {
+            from_root.or_else(|| {
+                let Some(provider) = from_graph_scan(false) else {
+                    return from_root_incompatible.or(from_pkg_deps_incompatible.clone());
+                };
+                let independently_provided =
+                    aube_lockfile::resolve_dep_edge(peer_name, &provider.target_tail, |key| {
+                        graph.packages.contains_key(key)
+                    })
+                    .is_some_and(|key| independent_packages.contains(&key));
+                if independently_provided {
+                    from_root_incompatible.or_else(|| {
+                        (options.dedupe_peer_dependents
+                            || locked_context.graph.is_some_and(|previous| {
+                                !optional_provider_was_unscoped(
+                                    previous,
+                                    peer_name,
+                                    &provider.target_tail,
+                                )
+                            }))
+                        .then_some(provider)
+                    })
+                } else {
+                    Some(provider)
+                }
+            })
+        } else {
+            locked_context
+                .provider(peer_name, declared_range, graph)
+                .filter(|_| !is_optional || options.retain_optional_peer_contexts)
+                .filter(|_| from_retained_replacement.is_none())
+                .or(from_optional_ancestor)
+                .or(from_retained_replacement)
+                .or(from_ancestor)
+                .or(from_pkg_deps)
+                .or(from_ancestor_incompatible)
+                .or(from_pkg_deps_incompatible)
+                .or(from_root)
+                .or(from_root_incompatible)
+                .or_else(|| {
+                    (!is_optional || options.dedupe_peer_dependents)
+                        .then(|| from_graph_scan(false))
+                        .flatten()
+                })
+        };
         if let Some(provider) = resolved {
             peer_context.push((peer_name.clone(), provider));
+        } else if new_optional_context {
+            unbound_optional_peers.insert(peer_name.clone());
         }
     }
     peer_context.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2480,6 +2635,9 @@ fn visit_peer_context<'g>(
     // nested form pnpm writes.
     let mut child_scope = ancestor_scope.clone();
     for (name, tail) in &pkg.dependencies {
+        if unbound_optional_peers.contains(name) {
+            continue;
+        }
         child_scope.insert(name.clone(), peer_provider(graph, name, tail));
     }
     for (name, provider) in &peer_context {
@@ -2504,6 +2662,9 @@ fn visit_peer_context<'g>(
     let mut visited_dep_names: FxHashSet<String> = FxHashSet::default();
 
     for (child_name, child_version_tail) in &pkg.dependencies {
+        if unbound_optional_peers.contains(child_name) {
+            continue;
+        }
         // If this child is a declared peer, its tail comes from the
         // peer context (which may be nested). Otherwise we use the
         // tail we already have — also possibly nested on a 2nd pass.
@@ -2516,6 +2677,7 @@ fn visit_peer_context<'g>(
             &child_canonical_dep_path,
             graph,
             name_index,
+            independent_packages,
             &child_scope,
             root_scope,
             out_packages,
@@ -2550,6 +2712,7 @@ fn visit_peer_context<'g>(
             &child_canonical_dep_path,
             graph,
             name_index,
+            independent_packages,
             &child_scope,
             root_scope,
             out_packages,
@@ -2634,6 +2797,52 @@ fn visit_peer_context<'g>(
     Some(contextualized)
 }
 
+fn optional_provider_was_unscoped(graph: &LockfileGraph, name: &str, tail: &str) -> bool {
+    let target = format!("{name}@{}", canonical_tail(tail));
+    let mut visited = FxHashSet::default();
+    let mut pending = Vec::new();
+    for deps in graph.importers.values() {
+        let supplied = deps
+            .iter()
+            .find(|dep| dep.name == name)
+            .is_some_and(|dep| canonical_tail(&dep.dep_path) == target);
+        pending.extend(deps.iter().map(|dep| (dep.dep_path.clone(), supplied)));
+    }
+    while let Some((key, supplied)) = pending.pop() {
+        let Some(pkg) = graph.packages.get(&key) else {
+            continue;
+        };
+        if !visited.insert((key, supplied)) {
+            continue;
+        }
+        if !supplied
+            && pkg
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional)
+            && pkg
+                .dependencies
+                .get(name)
+                .is_some_and(|old| canonical_tail(old) == canonical_tail(tail))
+        {
+            return true;
+        }
+        let supplied = pkg
+            .dependencies
+            .get(name)
+            .map(|own| canonical_tail(own) == canonical_tail(tail))
+            .unwrap_or(supplied);
+        for (child, tail) in &pkg.dependencies {
+            if let Some(key) =
+                aube_lockfile::resolve_dep_edge(child, tail, |key| graph.packages.contains_key(key))
+            {
+                pending.push((key, supplied));
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2713,6 +2922,104 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(out.packages.len(), 4000);
+    }
+
+    #[test]
+    fn complete_updates_keep_required_contexts_while_recomputing_optional_contexts() {
+        for optional in [false, true] {
+            let mut graph = LockfileGraph::default();
+            let mut consumer = locked("consumer", &[("peer", "1.0.0")]);
+            consumer.peer_dependencies.insert("peer".into(), "*".into());
+            if optional {
+                consumer
+                    .peer_dependencies_meta
+                    .insert("peer".into(), PeerDepMeta { optional: true });
+                consumer
+                    .optional_dependencies
+                    .insert("peer".into(), "1.0.0".into());
+            }
+            let mut peer_two = locked("peer", &[]);
+            peer_two.version = "2.0.0".into();
+            peer_two.dep_path = "peer@2.0.0".into();
+            for pkg in [
+                consumer,
+                locked("peer", &[]),
+                peer_two,
+                locked("hidden", &[("peer", "2.0.0")]),
+            ] {
+                graph.packages.insert(pkg.dep_path.clone(), pkg);
+            }
+            let direct = |name: &str| DirectDep {
+                name: name.into(),
+                dep_path: format!("{name}@1.0.0"),
+                dep_type: DepType::Production,
+                specifier: Some("1.0.0".into()),
+            };
+            graph.importers.insert(
+                ".".into(),
+                vec![direct("consumer"), direct("peer"), direct("hidden")],
+            );
+            let mut previous = graph.clone();
+            let mut old = previous.packages.remove("consumer@1.0.0").unwrap();
+            old.dep_path = "consumer@1.0.0(peer@2.0.0)".into();
+            old.dependencies.insert("peer".into(), "2.0.0".into());
+            previous.importers.get_mut(".").unwrap()[0].dep_path = old.dep_path.clone();
+            previous.packages.insert(old.dep_path.clone(), old);
+            let out = apply_peer_contexts_with_lockfile(
+                graph,
+                &PeerContextOptions {
+                    retain_optional_peer_contexts: false,
+                    ..Default::default()
+                },
+                Some(&previous),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                out.importers["."][0].dep_path,
+                format!(
+                    "consumer@1.0.0(peer@{})",
+                    if optional { "1.0.0" } else { "2.0.0" }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn new_optional_context_does_not_copy_an_unscoped_provider_without_dedupe() {
+        let mut graph = LockfileGraph::default();
+        let mut host = locked("host", &[("peer", "1.0.0")]);
+        host.peer_dependencies.insert("peer".into(), "^1".into());
+        host.peer_dependencies_meta
+            .insert("peer".into(), PeerDepMeta { optional: true });
+        host.optional_dependencies
+            .insert("peer".into(), "1.0.0".into());
+        for pkg in [host, locked("peer", &[])] {
+            graph.packages.insert(pkg.dep_path.clone(), pkg);
+        }
+        let direct = |name: &str| DirectDep {
+            name: name.into(),
+            dep_path: format!("{name}@1.0.0"),
+            dep_type: DepType::Production,
+            specifier: Some("1.0.0".into()),
+        };
+        graph.importers.insert("a".into(), vec![direct("host")]);
+        graph.importers.insert("b".into(), vec![direct("peer")]);
+        let previous = apply_peer_contexts(graph.clone(), &PeerContextOptions::default()).unwrap();
+        graph.importers.insert("c".into(), vec![direct("host")]);
+        let out = apply_peer_contexts_with_lockfile(
+            graph,
+            &PeerContextOptions {
+                dedupe_peer_dependents: false,
+                ..Default::default()
+            },
+            Some(&previous),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(out.importers["a"][0].dep_path, "host@1.0.0(peer@1.0.0)");
+        assert_eq!(out.importers["c"][0].dep_path, "host@1.0.0");
+        assert!(!out.packages["host@1.0.0"].dependencies.contains_key("peer"));
     }
 
     #[test]

@@ -772,10 +772,18 @@ async fn run_inner(
     }
     let resolver_manifests = [(".".to_string(), resolver_manifest)];
     let mut graph = resolver
-        .resolve_workspace(
+        .resolve_workspace_with_peer_history(
             &resolver_manifests,
             filtered_existing.as_ref(),
             &workspace_package_versions,
+            // A full refresh drops optional-only bindings even below an
+            // unchanged transitive. Picker and section selections behave like
+            // named targets, even when every visible dependency was selected.
+            if update_all && !args.interactive && !args.prod && !args.dev {
+                None
+            } else {
+                existing.as_ref()
+            },
         )
         .await
         .map_err(miette::Report::new)

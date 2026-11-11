@@ -727,6 +727,7 @@ pub(crate) fn lockfile_peer_context_options(
     settings_ctx: &aube_settings::ResolveCtx<'_>,
 ) -> aube_resolver::PeerContextOptions {
     aube_resolver::PeerContextOptions {
+        retain_optional_peer_contexts: true,
         dedupe_peer_dependents: super::settings::resolve_dedupe_peer_dependents(settings_ctx),
         dedupe_peers: super::settings::resolve_dedupe_peers(settings_ctx),
         resolve_from_workspace_root: super::settings::resolve_peers_from_workspace_root(
