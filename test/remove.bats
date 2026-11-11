@@ -391,3 +391,96 @@ EOF
 	refute_output --partial '"is-odd"'
 	refute_output --partial '"is-even"'
 }
+
+@test "aube remove: workspace member keeps workspace dependencies" {
+	mkdir -p packages/app packages/local
+	printf '%s\n' '{"name":"root","private":true,"workspaces":["packages/*"]}' >package.json
+	printf '%s\n' '{"name":"app","dependencies":{"local":"workspace:*","is-odd":"3.0.1"}}' >packages/app/package.json
+	printf '%s\n' '{"name":"local","version":"1.0.0"}' >packages/local/package.json
+	printf 'packages:\n  - packages/*\n' >pnpm-workspace.yaml
+	run aube install --ignore-scripts
+	assert_success
+	cd packages/app
+	run aube remove is-odd --ignore-scripts
+	assert_success
+	run node -e 'if (!require.resolve("local/package.json").endsWith("/packages/local/package.json")) process.exit(1)'
+	assert_success
+}
+
+@test "aube remove: workspace root removal keeps member lock entries" {
+	mkdir -p packages/app
+	printf '%s\n' '{"name":"root","private":true,"dependencies":{"is-odd":"3.0.1"}}' >package.json
+	printf 'packages:\n  - packages/*\n' >pnpm-workspace.yaml
+	printf '%s\n' '{"name":"app","dependencies":{"is-number":"6.0.0"}}' >packages/app/package.json
+	run aube install --ignore-scripts
+	assert_success
+	# Widen the member's range in the manifest and the lockfile together.
+	printf '%s\n' '{"name":"app","dependencies":{"is-number":">=6.0.0"}}' >packages/app/package.json
+	sed "s/specifier: 6.0.0/specifier: '>=6.0.0'/" aube-lock.yaml >aube-lock.yaml.tmp
+	mv aube-lock.yaml.tmp aube-lock.yaml
+	run grep -F "specifier: '>=6.0.0'" aube-lock.yaml
+	assert_success
+	run aube remove is-odd --ignore-scripts
+	assert_success
+	run grep -F 'is-odd' aube-lock.yaml
+	assert_failure 1
+	run grep -F 'is-number@7.0.0' aube-lock.yaml
+	assert_failure 1
+	run grep -F 'is-number@6.0.0' aube-lock.yaml
+	assert_success
+}
+
+@test "aube remove: shared members ignore stray lockfiles" {
+	for source in plain stray; do
+		mkdir -p "$source/packages/app" "$source/packages/local"
+		cp .npmrc "$source/.npmrc"
+		pushd "$source" >/dev/null
+		printf '%s\n' '{"name":"root","private":true}' >package.json
+		printf 'packages:\n  - packages/*\n' >pnpm-workspace.yaml
+		printf '%s\n' '{"name":"local","version":"1.0.0"}' >packages/local/package.json
+		if [ "$source" = stray ]; then
+			printf '%s\n' '{"name":"app","dependencies":{"local":"workspace:*","is-odd":"3.0.1"}}' >packages/app/package.json
+		else
+			printf '%s\n' '{"name":"app","dependencies":{"is-odd":"3.0.1"}}' >packages/app/package.json
+		fi
+		run aube install --ignore-scripts
+		assert_success
+		if [ "$source" = stray ]; then
+			printf "lockfileVersion: '9.0'\nimporters:\n  .: {}\n" >packages/app/aube-lock.yaml
+			cp packages/app/aube-lock.yaml before-lock.yaml
+		fi
+		pushd packages/app >/dev/null
+		run aube remove is-odd --ignore-scripts
+		assert_success
+		popd >/dev/null
+		run grep -F 'is-odd' aube-lock.yaml
+		assert_failure 1
+		if [ "$source" = stray ]; then
+			run cmp before-lock.yaml packages/app/aube-lock.yaml
+			assert_success
+		else
+			assert_file_not_exists packages/app/aube-lock.yaml
+		fi
+		popd >/dev/null
+	done
+}
+
+@test "aube remove: shared workspace prunes an optional-only peer" {
+	mkdir -p packages/app packages/other
+	printf '%s\n' '{"name":"root","private":true}' >package.json
+	printf 'packages:\n  - packages/*\n' >pnpm-workspace.yaml
+	printf '%s\n' '{"name":"other","version":"1.0.0"}' >packages/other/package.json
+	printf '%s\n' '{"name":"app","dependencies":{"fdir":"6.5.0","picomatch":"4.0.4"}}' >packages/app/package.json
+	run aube install --ignore-scripts
+	assert_success
+	cd packages/app
+	run aube remove picomatch --ignore-scripts
+	assert_success
+	run grep -F 'picomatch@4.0.4' ../../aube-lock.yaml
+	assert_failure 1
+	assert_file_not_exists aube-lock.yaml
+	run node -e 'const a=require("node:assert/strict"); a.throws(()=>require.resolve("picomatch"),{code:"MODULE_NOT_FOUND"}); require("fdir")'
+	assert_success
+	run aube install --frozen-lockfile --ignore-scripts
+	assert_success
+}
