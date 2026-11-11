@@ -13,6 +13,7 @@ pub(crate) mod locked_index;
 pub mod override_rule;
 mod package_ext;
 mod peer_context;
+mod peer_semver;
 pub mod platform;
 mod primer;
 mod resolve;
@@ -26,8 +27,9 @@ pub use local_source::{read_local_package_name, resolve_exec_script_path};
 pub use package_ext::is_deprecation_allowed;
 pub use peer_context::{
     PeerContextOptions, UnmetPeer, apply_peer_contexts, detect_unmet_peers,
-    hoist_auto_installed_peers,
+    detect_unmet_peers_in_importers, detect_unmet_peers_with_links, hoist_auto_installed_peers,
 };
+pub use peer_semver::peer_version_satisfies;
 pub use platform::{SupportedArchitectures, is_supported};
 pub use primer::{
     PruneStats as PrimerPruneStats, popular_package_names, prune_cache as prune_primer_cache,

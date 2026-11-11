@@ -30,6 +30,10 @@ pub struct UnmetPeer {
     pub from_dep_path: String,
     /// Human-friendly package name (pre-context) for display.
     pub from_name: String,
+    /// Real package name for parent selectors, resolving any npm alias.
+    pub from_registry_name: String,
+    /// Manifest version of the declaring package, independent of source identity.
+    pub from_version: String,
     /// Name of the peer being declared (e.g. `"react"`).
     pub peer_name: String,
     /// The declared peer range from the package's packument
@@ -42,51 +46,189 @@ pub struct UnmetPeer {
     pub found: Option<String>,
 }
 
-/// Scan declared peers for missing required providers and incompatible
-/// provided versions. Missing optional peers are allowed; a provided optional
-/// peer still reports a version mismatch, matching pnpm.
-///
-/// The "found" version for each package comes from its own
-/// `dependencies` map. Resolve that edge to the provider's manifest version
-/// so source identities and peer suffixes never participate in semver checks.
+/// Inspect peers only in importers that pnpm's resolver check flags, before
+/// rules are applied. Inspection can report additional prerelease mismatches
+/// that the resolver's base-release retry accepts. Packages without importer
+/// roots are outside the inspection scope.
 pub fn detect_unmet_peers(graph: &LockfileGraph) -> Vec<UnmetPeer> {
+    detect_unmet_peers_with_links(graph, &BTreeMap::new())
+}
+
+/// Linked-project peer snapshots, keyed by consuming importer. An empty entry
+/// still triggers inspection when a linked target's peers are unknown.
+/// These snapshots are inspection inputs only, never resolution candidates.
+pub fn detect_unmet_peers_with_links(
+    graph: &LockfileGraph,
+    linked_peers: &BTreeMap<String, Vec<LockedPackage>>,
+) -> Vec<UnmetPeer> {
+    detect_unmet_peers_in_importers(graph, linked_peers, None)
+}
+
+/// Inspect flagged importers selected for installation.
+/// `report_importers` scopes inspection to installed projects. The trigger walk
+/// still visits every resolved importer, preserving shared-context attribution.
+pub fn detect_unmet_peers_in_importers(
+    graph: &LockfileGraph,
+    linked_peers: &BTreeMap<String, Vec<LockedPackage>>,
+    report_importers: Option<&BTreeSet<String>>,
+) -> Vec<UnmetPeer> {
+    let mut visited = FxHashSet::default();
+    let mut flagged = BTreeSet::new();
+    let mut missing_packages = FxHashSet::default();
+    // Wrong-version triggers belong to the first importer that reaches a
+    // context. Missing peers also trigger every importer reaching that context.
+    for (id, deps) in &graph.importers {
+        let mut has_issue = linked_peers.contains_key(id);
+        walk_peer_packages(graph, deps, &mut visited, |pkg| {
+            let issues = scan_unmet_peers(
+                graph,
+                std::iter::once(pkg),
+                crate::peer_semver::declared_peer_version_satisfies,
+                true,
+            );
+            has_issue |= !issues.is_empty();
+            if issues.iter().any(|issue| issue.found.is_none()) {
+                missing_packages.insert(pkg.dep_path.as_str());
+            }
+        });
+        if has_issue && report_importers.is_none_or(|ids| ids.contains(id)) {
+            flagged.insert(id);
+        }
+    }
+    if !missing_packages.is_empty() {
+        // Propagate once through reverse edges, including cycles, rather than
+        // rescanning the shared subtree separately for every importer.
+        let mut parents: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+        for (key, pkg) in &graph.packages {
+            for (name, tail) in pkg.dependencies.iter().chain(&pkg.optional_dependencies) {
+                if let Some(child) = aube_lockfile::resolve_dep_edge(name, tail, |key| {
+                    graph.packages.contains_key(key)
+                }) {
+                    parents
+                        .entry(graph.packages[&child].dep_path.as_str())
+                        .or_default()
+                        .push(key);
+                }
+            }
+        }
+        let mut pending: Vec<_> = missing_packages.iter().copied().collect();
+        while let Some(key) = pending.pop() {
+            if let Some(ancestors) = parents.get(key) {
+                for &parent in ancestors {
+                    if missing_packages.insert(parent) {
+                        pending.push(parent);
+                    }
+                }
+            }
+        }
+        for (id, deps) in &graph.importers {
+            if report_importers.is_none_or(|ids| ids.contains(id))
+                && deps
+                    .iter()
+                    .any(|dep| missing_packages.contains(dep.dep_path.as_str()))
+            {
+                flagged.insert(id);
+            }
+        }
+    }
+    if flagged.is_empty() {
+        return Vec::new();
+    }
+    visited.clear();
     let mut unmet = Vec::new();
-    for pkg in graph.packages.values() {
+    for id in flagged {
+        let mut inspect = |pkg: &LockedPackage| {
+            unmet.extend(scan_unmet_peers(
+                graph,
+                std::iter::once(pkg),
+                crate::peer_semver::declared_peer_report_satisfies,
+                false,
+            ));
+        };
+        if let Some(packages) = linked_peers.get(id) {
+            for pkg in packages {
+                inspect(pkg);
+            }
+        }
+        walk_peer_packages(graph, &graph.importers[id], &mut visited, inspect);
+    }
+    unmet.sort_by(|a, b| {
+        (a.from_dep_path.as_str(), a.peer_name.as_str())
+            .cmp(&(b.from_dep_path.as_str(), b.peer_name.as_str()))
+    });
+    unmet
+}
+
+fn walk_peer_packages<'a>(
+    graph: &'a LockfileGraph,
+    deps: &[DirectDep],
+    visited: &mut FxHashSet<String>,
+    mut visit: impl FnMut(&'a LockedPackage),
+) {
+    let mut pending: Vec<_> = deps.iter().map(|dep| dep.dep_path.clone()).collect();
+    while let Some(key) = pending.pop() {
+        if !visited.insert(key.clone()) {
+            continue;
+        }
+        let Some(pkg) = graph.packages.get(&key) else {
+            continue;
+        };
+        visit(pkg);
+        pending.extend(
+            pkg.dependencies
+                .iter()
+                .chain(&pkg.optional_dependencies)
+                .filter_map(|(name, tail)| {
+                    aube_lockfile::resolve_dep_edge(name, tail, |key| {
+                        graph.packages.contains_key(key)
+                    })
+                }),
+        );
+    }
+}
+
+/// Resolve providers to manifest versions so source identities and peer
+/// suffixes never participate in semver checks. Missing optional peers trigger
+/// inspection but are omitted from the report.
+fn scan_unmet_peers<'a>(
+    graph: &LockfileGraph,
+    packages: impl Iterator<Item = &'a LockedPackage>,
+    satisfies: fn(&str, &str) -> bool,
+    include_optional_missing: bool,
+) -> Vec<UnmetPeer> {
+    let mut unmet = Vec::new();
+    for pkg in packages {
         for (peer_name, declared_range) in &pkg.peer_dependencies {
             let optional = pkg
                 .peer_dependencies_meta
                 .get(peer_name)
-                .map(|m| m.optional)
-                .unwrap_or(false);
-            let found_tail = pkg.dependencies.get(peer_name);
-            if optional && found_tail.is_none() {
+                .is_some_and(|m| m.optional);
+            let found_tail = pkg
+                .dependencies
+                .get(peer_name)
+                .or_else(|| pkg.optional_dependencies.get(peer_name));
+            if optional && found_tail.is_none() && !include_optional_missing {
                 continue;
             }
             let found_version =
                 found_tail.map(|tail| peer_provider(graph, peer_name, tail).version);
-
-            let satisfied = match &found_version {
-                Some(v) => version_satisfies(v, declared_range),
-                None => false,
-            };
-            if satisfied {
+            if found_version
+                .as_ref()
+                .is_some_and(|v| satisfies(v, declared_range))
+            {
                 continue;
             }
-
             unmet.push(UnmetPeer {
                 from_dep_path: pkg.dep_path.clone(),
                 from_name: pkg.name.clone(),
+                from_registry_name: pkg.registry_name().to_string(),
+                from_version: pkg.version.clone(),
                 peer_name: peer_name.clone(),
                 declared: declared_range.clone(),
                 found: found_version,
             });
         }
     }
-    // Stable order for deterministic test output and readable warnings.
-    unmet.sort_by(|a, b| {
-        (a.from_dep_path.as_str(), a.peer_name.as_str())
-            .cmp(&(b.from_dep_path.as_str(), b.peer_name.as_str()))
-    });
     unmet
 }
 

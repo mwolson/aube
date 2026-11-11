@@ -1160,16 +1160,6 @@ fn tarball_url_path(url: &str) -> Option<String> {
         .then_some(path.trim_start_matches('/').to_string())
 }
 
-/// Pull the canonical version off a dep_path for display purposes. The
-/// dep_path looks like `name@1.2.3(peer@x)` — we strip the `name@` prefix
-/// and any peer suffix so the warning shows `1.2.3` not `1.2.3(peer@x)`.
-pub(super) fn version_from_dep_path(dep_path: &str, name: &str) -> String {
-    let tail = dep_path
-        .strip_prefix(&format!("{name}@"))
-        .unwrap_or(dep_path);
-    tail.split('(').next().unwrap_or(tail).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::lockfile_tarball_url_matches_metadata;
